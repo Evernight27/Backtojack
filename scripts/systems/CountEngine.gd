@@ -9,8 +9,8 @@ var decks_remaining: float = 1.0
 var count_system: String = "hi_lo"
 
 
-# A fresh shoe reads TRUE COUNT 0 for every system — balanced (hi_lo) or
-# unbalanced (ko net +4/deck, hi_opt_ii net -12/deck). This is the correct
+# A fresh shoe reads TRUE COUNT 0 for every system — balanced (hi_lo, hi_opt_ii)
+# or unbalanced (ko net +8/deck). This is the correct
 # "neutral fresh shoe" anchor and matches real counting: a counter sits down at
 # a fresh shoe with running count 0 regardless of system. The unbalanced net is
 # a property of a full shoe's per-card values, NOT a start offset — applying a

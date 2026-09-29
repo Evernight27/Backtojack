@@ -55,6 +55,7 @@ func _expect(cond: bool, msg: String) -> void:
 # --- 1. Practice mode completes after N shoes ---
 func _check_practice_completion() -> void:
 	var c := CHTableConfig.for_tier(1)
+	c.opponent = null  # isolate lifecycle mechanics from the social opponent
 	var state := CHGameState.new()
 	# Only 2 shoes required so the test is fast.
 	state.start_session(1, CHGameState.MODE_PRACTICE, 0, 2)
@@ -103,6 +104,7 @@ func _check_practice_completion() -> void:
 # so the only terminal reason is survival_complete.
 func _check_survival_completion() -> void:
 	var c := CHTableConfig.for_tier(1)
+	c.opponent = null  # isolate lifecycle mechanics from the social opponent
 	var state := CHGameState.new()
 	# Only 2 shoes required so the test is fast.
 	state.start_session(1, CHGameState.MODE_SURVIVAL, 0, 2)
@@ -144,6 +146,7 @@ func _check_heat_floor_writeback() -> void:
 	var c := CHTableConfig.for_tier(1)
 	c.heat_active = true
 	c.heat_sensitivity_multiplier = 1.0
+	c.opponent = null  # isolate heat-floor mechanics from the social opponent
 	var state := CHGameState.new()
 	# Target 1 unit above the 100 starting stake: the session ends within a few
 	# hands (first net-positive P&L), well before the seeded heat decays to zero.
@@ -197,6 +200,7 @@ func _check_heat_floor_writeback() -> void:
 # --- 3. Cash out: player voluntarily ends the session ---
 func _check_cash_out() -> void:
 	var c := CHTableConfig.for_tier(1)
+	c.opponent = null  # isolate cash-out mechanics from the social opponent
 	var state := CHGameState.new()
 	# Target mode with an unreachable goal so the session only ends via cash_out.
 	state.start_session(1, CHGameState.MODE_TARGET, 999999)
@@ -237,6 +241,7 @@ func _check_cash_out() -> void:
 # save() fails deterministically without touching the real user save.
 func _check_save_failed_signal() -> void:
 	var c := CHTableConfig.for_tier(1)
+	c.opponent = null  # isolate save-failed mechanics from the social opponent
 	var state := CHGameState.new()
 	state.start_session(1, CHGameState.MODE_TARGET, 999999)  # unreachable -> cash_out ends it
 	var disc := CHDisciplineSystem.new()
@@ -253,6 +258,7 @@ func _check_save_failed_signal() -> void:
 	_expect(fired.count == 1, "save-failed: save_failed emitted exactly once, got %d" % fired.count)
 	# Control: a healthy save must NOT emit save_failed.
 	var c2 := CHTableConfig.for_tier(1)
+	c2.opponent = null  # isolate save-failed mechanics from the social opponent
 	var state2 := CHGameState.new()
 	state2.start_session(1, CHGameState.MODE_TARGET, 999999)
 	var loop2 := CHGameLoop.new(c2, state2, CHDisciplineSystem.new(), SEED)
@@ -298,6 +304,7 @@ func _check_discipline_lowering_rating() -> void:
 func _run_rating_session(play_optimal: bool, hands_count: int = 20) -> float:
 	var c := CHTableConfig.for_tier(2)
 	c.count_check_active = false  # process score = pure discipline
+	c.opponent = null  # isolate rating mechanics from the social opponent
 	var state := CHGameState.new()
 	state.start_session(2, CHGameState.MODE_TARGET, 999999)  # unreachable -> only cash_out ends it
 	var disc := CHDisciplineSystem.new()

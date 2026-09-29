@@ -44,6 +44,11 @@ const ACT_INS_TAKE := "take"    # insurance: take the side bet
 const ACT_INS_DECLINE := "decline"  # insurance: decline
 # Autopilot sentinel for the BET phase: places the count-optimal (ramp) bet.
 const ACT_BET := "bet"
+# Player recovery action, available only between hands (IDLE/SETTLED): a
+# deliberate "ground yourself" that tops up composure and breaks the mistake
+# streak. Budgeted per shoe so it cannot make the spiral free.
+const ACT_GROUND := "ground"
+const GROUND_USES_PER_SHOE: int = 3
 # Bet units the player may choose. The ramp's optimal value always lives in
 # this range, so a correct play is never forced out of range.
 const MAX_BET_UNITS: int = 6
@@ -85,6 +90,20 @@ var _last_wagered: float = 0.0
 # group once processed. `_root_idx` tracks which root the presplit phase is on.
 var _roots: Array[CHHand] = []
 var _root_idx: int = 0
+# NPC players (config.npc_players): auto-played hands that sit at the table,
+# consume cards from the same shoe, and are visible for the counting drill.
+# Their P&L is never tracked; they only affect the card stream and the display.
+var _npc_hands: Array[CHHand] = []
+# The named social opponent (config.opponent): one NPC seat whose bankroll and
+# P&L ARE tracked, so the "friend → casino" arc has a real rival. Its hand is
+# kept apart from _npc_hands so the UI can show it distinctly. Null on tables
+# with no opponent (tier 1). _opponent_bet is frozen at deal time (the rival
+# commits before seeing the outcome). _opponent_settled guards against settling
+# it more than once per round.
+var opponent: CHOpponent = null
+var _opponent_hand: CHHand = null
+var _opponent_bet: int = 1
+var _opponent_settled: bool = false
 # Live dealer hand (upcard; hole appended on reveal).
 var _dealer: CHHand = null
 var _hole: CHCard = null
@@ -99,6 +118,18 @@ var _early_surrender_phase: bool = false
 # _play_dealer_and_settle so those wins count toward the hand result.
 var _pre_settled_profit: float = 0.0
 var _pre_settled_wagered: float = 0.0
+# True while the current hand is a "backoff hand": the player was flagged at the
+# end of the previous hand and must lay low (minimum bet) for this hand. The
+# optimal bet is forced to 1 so the discipline system does not penalize the
+# player for a bet they cannot choose. Cleared at the end of the hand.
+var _backoff_hand: bool = false
+# True only while auto_play_round() is driving the hand (the count-only teaching
+# table plays itself). Engine-made play calls are not player agency, so they must
+# not feed the composure model: without this, the engine's "correct" auto-plays
+# would call on_success() on every hit/stand, constantly recovering composure and
+# resetting the mistake streak, structurally neutralizing the count-miss spiral
+# that report_count() is meant to drive on the teaching table.
+var _engine_play: bool = false
 
 # Count-accuracy check (M16). At each shoe cut the loop captures the true
 # running count and asks the player to report theirs; report_count() grades it
@@ -109,6 +140,13 @@ var _count_accuracy: CHCountAccuracySystem
 var _last_shoe_rc: int = 0
 # True while a captured shoe count is awaiting the player's report.
 var _count_check_due: bool = false
+# True while a mid-hand shoe runout already completed the session internally
+# (on_shoe_finished -> end_session) but the session_ended signal must be deferred
+# to _finalize so the debrief is not shown over a live hand.
+var _shoe_end_deferred: bool = false
+# Per-shoe budget for the ACT_GROUND recovery action (mirrors the cover-play
+# budget: a deliberate, limited player choice rather than an open valve).
+var _ground_uses_left: int = GROUND_USES_PER_SHOE
 
 
 # Local signals (bound to the UI by Main.gd), kept local so this class is
@@ -136,6 +174,12 @@ signal mental_recovered()
 # crossfades, intrusive-thought triggers, audio distortion — that key off the
 # coarse band rather than the raw stability value.
 signal mental_band_changed(old_band: String, new_band: String)
+# The named social opponent (venue arc) — a tracked NPC with its own bankroll
+# who plays this table. opponent_settled fires after every resolved hand with
+# the opponent's net P&L; opponent_busted fires the (rare) moment its bankroll
+# hits zero, ending its seat for the session.
+signal opponent_settled(net: float)
+signal opponent_busted()
 
 
 func _init(
@@ -158,6 +202,15 @@ func _init(
 	_heat.apply_sensitivity(config.heat_sensitivity_multiplier)
 	_heat.reset(state.get_heat_floor(state.current_tier))
 	_mental = CHMentalStateSystem.new()
+	# The "going insane" spiral is a difficulty lever keyed to the tier ladder:
+	# harder tables erode stability faster, recover slower, and (from T4) amplify
+	# mistakes made while already insane. Tier 1 keeps the historical profile so
+	# the teaching table stays calm (see CHMentalConfig.for_tier).
+	_mental.configure(CHMentalConfig.for_tier(config.tier))
+	opponent = config.opponent
+	_opponent_hand = null
+	_opponent_bet = 1
+	_opponent_settled = false
 	shoe.build(config, _seed)
 
 
@@ -178,13 +231,30 @@ func get_count_accuracy() -> CHCountAccuracySystem:
 	return _count_accuracy
 
 
+# The social opponent for this session (null on tables without one).
+func get_opponent() -> CHOpponent:
+	return opponent
+
+
+# The opponent's live hand (populated during a round, null after settlement).
+func opponent_hand() -> CHHand:
+	return _opponent_hand
+
+
+# The opponent's current bet in units (frozen at deal time for the active round).
+func opponent_bet() -> int:
+	return _opponent_bet
+
+
 # True while a shoe's captured running count is awaiting the player's report.
 func is_count_check_due() -> bool:
 	return _count_check_due
 
 
-# The true running count at the most recent shoe cut (what the player should
-# have reported). Only meaningful while count_check_due() is true.
+# The true running count at the most recent count check — the shoe cut on
+# normal tables, or the end of the last settled hand on the count-only teaching
+# table (where the check fires per-hand, not at the cut). What the player should
+# have reported. Only meaningful while count_check_due() is true.
 func last_shoe_rc() -> int:
 	return _last_shoe_rc
 
@@ -215,6 +285,15 @@ func report_count(reported_rc: int) -> Dictionary:
 		return {}
 	var r: Dictionary = _count_accuracy.record(reported_rc, _last_shoe_rc)
 	_count_check_due = false
+	# Composure: a miscount erodes composure ("You missed the seven"), a clean
+	# report steadies it. Scale by the error magnitude so a 1-off is a nudge.
+	# This is what drives the spiral on the count-only teaching table, where the
+	# hand auto-plays and no play-decision mistakes exist.
+	var abs_err: int = int(r.abs_error)
+	if abs_err <= 1:
+		_feed_mental(true)
+	else:
+		_feed_mental(false, 0.5 if abs_err <= 3 else 1.0)
 	return r
 
 
@@ -250,6 +329,14 @@ func cash_out() -> bool:
 # been recorded this session it falls back to discipline alone so a session
 # without count checks does not dilute the rating.
 func _session_process_score() -> float:
+	# Count-only teaching table: the player made no play decisions, so discipline
+	# is pinned near 100 and is not a skill signal. Blending it in (as on real
+	# tables) would let a poor counter still clear higher tiers — the whole point
+	# of this table is to gate progression on counting, so the process score IS
+	# the count accuracy. (With no recorded checks the accuracy is neutral 100,
+	# which matches the old behaviour for a skipped check.)
+	if config.count_only:
+		return _count_accuracy.accuracy
 	if _count_accuracy.checks <= 0:
 		return discipline.discipline
 	return lerpf(discipline.discipline, _count_accuracy.accuracy, PROCESS_BLEND_COUNT_WEIGHT)
@@ -283,32 +370,56 @@ func start_or_next_shoe() -> bool:
 		_on_new_shoe()
 		shoe_reshuffled.emit()
 		_last_shoe_rc = cut_rc
-		if config.count_check_active and state.is_session_active():
+		# Count-only teaching table (Tier 1): the per-hand check in _finalize()
+		# already quizzed the player on this shoe's running count, so skip the
+		# shoe-cut prompt here to avoid asking the same count twice.
+		if config.count_check_active and not config.count_only and state.is_session_active():
 			_count_check_due = true
 			count_check_due.emit(cut_rc)
 	return true
 
 
 # New-shoe bookkeeping: drain the per-shoe decision log, reset the cover-play
-# budget, advance the shoe counter, and write back the persistent heat floor if
-# the shoe completion ended the session (practice/survival). Called on every
-# shoe boundary (start-of-hand cut and mid-hand runout).
-func _on_new_shoe() -> void:
+# budget, advance the shoe counter, and (unless deferred) persist the heat floor
+# and surface session_ended if the shoe completion ended the session
+# (practice/survival/tutorial). Called on every shoe boundary (start-of-hand cut
+# and mid-hand runout). `mid_hand` is true when the shoe ran out during an
+# in-progress hand (a cut-change runout); in that case a session-end is deferred
+# to _finalize so the debrief is not shown over a live hand (_shoe_end_deferred).
+func _on_new_shoe(mid_hand: bool = false) -> void:
 	discipline.get_and_clear_shoe_decisions()
 	discipline.reset_for_new_shoe()
+	_ground_uses_left = GROUND_USES_PER_SHOE
 	var ended: bool = state.on_shoe_finished(_session_process_score())
+	if ended and mid_hand:
+		# A mid-hand cut-change can complete the FINAL shoe of a
+		# practice/survival/tutorial session. The session is already ended
+		# internally (on_shoe_finished -> end_session -> save), but we must not
+		# surface session_ended until the hand that triggered the runout settles —
+		# otherwise the debrief would appear over a live hand and that hand's
+		# apply_hand_result would no-op. Defer the signal to _finalize.
+		_shoe_end_deferred = true
+		return
 	if ended:
-		# The session-end save ran inside on_shoe_finished; surface a failure
-		# before the (separate) heat-floor write below can mask it.
-		if not state.last_save_ok:
-			push_error("CHGameLoop: session-end save failed on shoe completion; progression may not have been persisted")
-			save_failed.emit()
-		if config.heat_active:
-			state.set_heat_floor(state.current_tier, _heat.heat)
-			if not state.save():
-				push_error("CHGameLoop: failed to persist tier-%d heat floor (shoe completion)" % state.current_tier)
-		_count_check_due = false
-		session_ended.emit()
+		_complete_ended_shoe()
+
+
+# Surfaces a shoe-completion session end: flags a save failure, persists the
+# ending heat as the tier's reputation floor, suppresses any pending count check,
+# and emits session_ended. Called from _on_new_shoe (start-of-hand cut) and, when
+# a mid-hand cut-change completed the final shoe, from _finalize.
+func _complete_ended_shoe() -> void:
+	# The session-end save ran inside on_shoe_finished; surface a failure
+	# before the (separate) heat-floor write below can mask it.
+	if not state.last_save_ok:
+		push_error("CHGameLoop: session-end save failed on shoe completion; progression may not have been persisted")
+		save_failed.emit()
+	if config.heat_active:
+		state.set_heat_floor(state.current_tier, _heat.heat)
+		if not state.save():
+			push_error("CHGameLoop: failed to persist tier-%d heat floor (shoe completion)" % state.current_tier)
+	_count_check_due = false
+	session_ended.emit()
 
 
 # Starts a new hand: enters the BET phase. The player must then call
@@ -340,6 +451,10 @@ func begin_hand() -> bool:
 		elif _heat.has_pending_backoff():
 			heat_backoff.emit()
 			_heat.reset(state.get_heat_floor(state.current_tier))
+			# The player was just flagged: the current hand is a "backoff hand"
+			# where they must lay low. optimal_bet_units() returns 1 so the
+			# discipline system does not penalize a bet the player cannot choose.
+			_backoff_hand = true
 	_set_phase(PHASE_BET)
 	return true
 
@@ -349,6 +464,8 @@ func begin_hand() -> bool:
 # a flat minimum bet — counting stops helping.
 func optimal_bet_units() -> int:
 	if config.continuous_shuffle:
+		return 1
+	if _backoff_hand:
 		return 1
 	return _bet_for_tc(_tc)
 
@@ -375,15 +492,48 @@ func place_bet(units: int, is_cover: bool = false) -> bool:
 		r = {"delta": 0.0, "discipline": discipline.discipline}
 	decision_graded.emit(float(r.delta), float(r.discipline))
 	_base_bet = clamped
+	# Composure: a mis-sized bet (that isn't a declared cover play) is a lapse
+	# the same way a wrong play is — overbetting a cold count reads as tilt,
+	# underbetting a hot count as fear. A correct (optimal) bet steadies. Skipped
+	# for engine-driven auto-bets (auto_play_round): no player agency to read.
+	if not _engine_play:
+		_feed_bet_composure(clamped, optimal, cover_granted)
 	# Heat tell: betting big on a hot count reads as counting. A granted cover
 	# bet is a deliberate lay-low play and suppresses the tell. No count exists on
-	# a continuous-shuffle table, so a big bet there is not a count tell.
-	if config.heat_active and not config.continuous_shuffle and _tc >= CHHeatSystem.BET_TELL_TC and clamped >= CHHeatSystem.BET_TELL_MIN_UNITS and not cover_granted:
-		var hd: float = _heat.on_tell(CHHeatSystem.BET_TELL_GAIN)
+	# a continuous-shuffle table, so a big bet there is not a count tell. On a
+	# count-only teaching table the player never places the bet (the engine
+	# auto-plays it), so there is no player agency to reveal — suppress the tell
+	# and keep the drill pressure-free.
+	if config.heat_active and not config.continuous_shuffle and not config.count_only and _tc >= CHHeatSystem.BET_TELL_TC and clamped >= CHHeatSystem.BET_TELL_MIN_UNITS and not cover_granted:
+		var hd: float = _heat.on_tell(CHHeatSystem.BET_TELL_GAIN * _tell_multiplier())
 		if hd > 0.0:
 			heat_changed.emit(_heat.heat)
 	_deal_opening()
 	return true
+
+
+# Count-only teaching table (config.count_only): the player's only job is to
+# track the running count, so the scene calls this right after begin_hand() to
+# deal and play the whole round with the engine's optimal actions. The player
+# never bets, covers, or makes a play call — the hand resolves on its own and the
+# loop returns to PHASE_SETTLED, leaving the shoe-cut count report as the sole
+# interaction. No-op unless the loop is in the BET phase (safe to call blindly).
+func auto_play_round() -> void:
+	if _phase != PHASE_BET:
+		return
+	# The engine is making every call this round, not the player — gate the
+	# composure feeds (see _engine_play) so the auto-played "correct" plays do not
+	# steady composure or reset the mistake streak.
+	_engine_play = true
+	place_bet(optimal_bet_units(), false)
+	var guard: int = 0
+	while not is_idle() and guard < 64:
+		var a: String = optimal_action()
+		if a == "":
+			break
+		apply_action(a)
+		guard += 1
+	_engine_play = false
 
 
 # Deals the opening cards: one dealer upcard + hole, then a two-card root hand
@@ -412,6 +562,38 @@ func _deal_opening() -> void:
 		_reveal(p2, false)
 	_reveal(upcard, true)
 
+	# NPC players (higher-tier tables): deal each NPC's two-card hand and reveal
+	# it so it enters the counting stream. NPCs play flat basic strategy (no
+	# count, no split/double/surrender) and their P&L is never tracked — they are
+	# there to fill the table and give the player a richer visible card stream.
+	_npc_hands.clear()
+	for i in config.npc_players:
+		var n1: CHCard = shoe.deal()
+		var n2: CHCard = shoe.deal()
+		var nh := CHHand.new()
+		nh.add_card(n1)
+		nh.add_card(n2)
+		_reveal(n1, false)
+		_reveal(n2, false)
+		_npc_hands.append(nh)
+
+	# The named social opponent (venue arc): a tracked NPC seat dealt alongside
+	# the filler NPCs. Its bet is frozen now (before the outcome is known) and its
+	# hand is settled at round end in _finalize. Absent on tables without one.
+	# A busted rival keeps its seat for the rest of the session (no more dealing,
+	# no more settling) — the opponent_busted signal's "seat ends" contract.
+	_opponent_hand = null
+	_opponent_settled = false
+	if opponent != null and not opponent.is_busted():
+		var o1: CHCard = shoe.deal()
+		var o2: CHCard = shoe.deal()
+		_opponent_hand = CHHand.new()
+		_opponent_hand.add_card(o1)
+		_opponent_hand.add_card(o2)
+		_reveal(o1, false)
+		_reveal(o2, false)
+		_opponent_bet = opponent.choose_bet({"tc": effective_tc()})
+
 	_insurance_offered = config.allows_insurance and upcard.rank == 14
 	_insurance_bet = 0.0
 	if _insurance_offered:
@@ -434,6 +616,10 @@ func available_actions() -> Array[String]:
 		PHASE_HAND:
 			return _hand_actions()
 		_:
+			# Between hands (IDLE/SETTLED): the only player action is the
+			# budgeted "ground yourself" composure recovery.
+			if is_idle() and _ground_uses_left > 0:
+				return [ACT_GROUND]
 			return []
 
 
@@ -520,7 +706,23 @@ func optimal_action() -> String:
 			return ""
 
 
-# Applies a player action. Must be in a decision phase (bet/insurance/presplit/hand).
+# Whether the current optimal play (PHASE_HAND) is an I18 counting deviation
+# from flat basic strategy at the live true count — i.e. the count is what makes
+# the optimal call differ from basic. False outside the HAND phase and under CSS
+# (effective_tc() is 0 there, so no count deviation applies). Used to tag the
+# player-facing decision feedback so the trainer shows *when* the count changed
+# the right play.
+func is_deviation_play() -> bool:
+	if _phase != PHASE_HAND or _idx < 0 or _idx >= _hands.size():
+		return false
+	var h: CHHand = _hands[_idx]
+	if h.split_ace:
+		return false
+	return engine.is_counting_deviation(h, _up_key, config, effective_tc())
+
+
+# Applies a player action. Must be in a decision phase (bet/insurance/presplit/hand)
+# or IDLE/SETTLED (the between-hands "ground yourself" recovery action).
 func apply_action(action: String) -> void:
 	match _phase:
 		PHASE_BET:
@@ -531,6 +733,8 @@ func apply_action(action: String) -> void:
 			_apply_presplit(action)
 		PHASE_HAND:
 			_apply_hand(action)
+		PHASE_IDLE, PHASE_SETTLED:
+			_apply_ground(action)
 		_:
 			push_warning("CHGameLoop: apply_action in phase %s" % _phase)
 
@@ -541,6 +745,23 @@ func _apply_bet(_action: String) -> void:
 	place_bet(optimal_bet_units(), false)
 
 
+# The between-hands recovery action: a deliberate "ground yourself" that tops up
+# composure and breaks the mistake streak (the player's agency lever against the
+# spiral). Spent from a per-shoe budget (GROUND_USES_PER_SHOE) so it cannot make
+# the spiral free; a no-op when already at full composure (nothing to recover)
+# or once the shoe's budget is spent.
+func _apply_ground(action: String) -> void:
+	if action != ACT_GROUND or _ground_uses_left <= 0:
+		return
+	if _mental.stability >= CHMentalStateSystem.MAX_MENTAL:
+		return
+	_ground_uses_left -= 1
+	var was_insane: bool = _mental.is_insane()
+	var old_band: String = _mental.mental_state()
+	_mental.ground()
+	_emit_mental_transitions(was_insane, old_band)
+
+
 func _apply_insurance(action: String) -> void:
 	if action == ACT_INS_TAKE:
 		# Insurance is 1/2 of the main bet, per spot. A single decision covers all
@@ -549,9 +770,10 @@ func _apply_insurance(action: String) -> void:
 	var opt := optimal_action()
 	_grade(action, opt)
 	# Heat tell: taking insurance at a hot count reveals count knowledge. Not a
-	# tell on a continuous-shuffle table (no count to reveal).
-	if action == ACT_INS_TAKE and config.heat_active and not config.continuous_shuffle and _tc >= engine.INSURANCE_TC_THRESHOLD:
-		var hd: float = _heat.on_tell(CHHeatSystem.INSURANCE_TELL_GAIN)
+	# tell on a continuous-shuffle table (no count to reveal) or a count-only
+	# teaching table (the engine auto-decides insurance; the player has no agency).
+	if action == ACT_INS_TAKE and config.heat_active and not config.continuous_shuffle and not config.count_only and _tc >= engine.INSURANCE_TC_THRESHOLD:
+		var hd: float = _heat.on_tell(CHHeatSystem.INSURANCE_TELL_GAIN * _tell_multiplier())
 		if hd > 0.0:
 			heat_changed.emit(_heat.heat)
 	_after_insurance()
@@ -591,9 +813,11 @@ func _apply_hand(action: String) -> void:
 	_grade(action, opt)
 	# Heat tell: making a counting deviation (playing off basic strategy because
 	# of the live count) reveals count knowledge to the pit. Under CSS there is
-	# no live count, so effective_tc() is 0 and this is naturally never true.
-	if action == opt and config.heat_active and engine.is_counting_deviation(h, _up_key, config, effective_tc()):
-		var hd: float = _heat.on_tell(CHHeatSystem.DEV_TELL_GAIN)
+	# no live count, so effective_tc() is 0 and this is naturally never true. On a
+	# count-only teaching table the engine auto-plays, so the deviation is not a
+	# player reveal — suppress it.
+	if action == opt and config.heat_active and not config.count_only and engine.is_counting_deviation(h, _up_key, config, effective_tc()):
+		var hd: float = _heat.on_tell(CHHeatSystem.DEV_TELL_GAIN * _tell_multiplier())
 		if hd > 0.0:
 			heat_changed.emit(_heat.heat)
 	match action:
@@ -601,7 +825,6 @@ func _apply_hand(action: String) -> void:
 			var c: CHCard = _deal_card()
 			h.add_card(c)
 			_reveal(c, false)
-			card_dealt.emit(c, false)
 			if h.is_bust():
 				_advance_to_next_hand()
 			else:
@@ -611,7 +834,6 @@ func _apply_hand(action: String) -> void:
 				var dc: CHCard = _deal_card()
 				h.add_card(dc)
 				_reveal(dc, false)
-				card_dealt.emit(dc, false)
 				_bets[_idx] = bet * 2.0
 			_advance_to_next_hand()
 		ACT_SURRENDER:
@@ -681,6 +903,10 @@ func _after_insurance() -> void:
 		_settle_natural(dealer_bj)
 		return
 
+	# NPCs act before the dealer, real-blackjack order. A dealer natural settles
+	# the round immediately (handled above), so NPCs only draw when it is absent.
+	_play_npcs()
+
 	# A natural on one or more player spots, no dealer natural (M105): those
 	# spots win 3:2 now, but the remaining spots keep playing through the normal
 	# presplit/hand flow. Previously the whole round settled here and every
@@ -713,6 +939,72 @@ func _after_insurance() -> void:
 	_surrendered.clear()
 	_root_idx = 0
 	_process_next_root()
+
+
+# Auto-plays every NPC hand to completion with flat basic strategy (tc 0). Called
+# once per round from _after_insurance when the dealer has no natural. NPCs never
+# split/double/surrender: a single hand played to 17+ keeps the card stream simple
+# and the shoe bookkeeping exact. Their P&L is never tracked.
+func _play_npcs() -> void:
+	# The tracked opponent plays with basic strategy using its own effective TC
+	# (which may differ from the player's due to the misread mechanic).
+	if opponent != null and _opponent_hand != null:
+		var guard_o: int = 0
+		while not _opponent_hand.is_bust() and guard_o < 12:
+			# Sal plays basic strategy keyed to the running count (effective TC),
+			# so at higher tiers the rival counts too and is harder to beat.
+			var p: String = engine.best_play_no_split(_opponent_hand, _up_key, config, effective_tc())
+			if p != "hit":
+				break
+			var c: CHCard = _deal_card()
+			_opponent_hand.add_card(c)
+			_reveal(c, false)
+			guard_o += 1
+
+	for nh in _npc_hands:
+		var guard: int = 0
+		while not nh.is_bust() and guard < 12:
+			var p: String = engine.best_play_no_split(nh, _up_key, config, 0)
+			if p != "hit":
+				break
+			var c: CHCard = _deal_card()
+			nh.add_card(c)
+			_reveal(c, false)
+			guard += 1
+
+
+# Settles the tracked opponent's hand against the dealer. Called once per round
+# from _finalize (guarded by _opponent_settled). The result is applied to the
+# opponent's bankroll and signals are emitted for the UI.
+func _settle_opponent() -> void:
+	if _opponent_hand == null or _opponent_hand.cards.size() < 2:
+		return
+	var bet: float = float(_opponent_bet)
+	var opp_total: int = _opponent_hand.total()
+	var dealer_bj: bool = _dealer.is_blackjack()
+	var opp_bj: bool = _opponent_hand.is_blackjack()
+	var opp_net: float = 0.0
+	if opp_bj and dealer_bj:
+		opp_net = 0.0  # push
+	elif opp_bj:
+		opp_net = bet * config.blackjack_payout
+	elif dealer_bj:
+		opp_net = -bet
+	elif _opponent_hand.is_bust():
+		opp_net = -bet
+	elif _dealer.is_bust():
+		opp_net = bet
+	elif opp_total > _dealer.total():
+		opp_net = bet
+	elif opp_total < _dealer.total():
+		opp_net = -bet
+	# push: opp_net stays 0.0
+	opponent.apply_result(opp_net)
+	opponent_settled.emit(opp_net)
+	if opponent.is_busted():
+		opponent_busted.emit()
+	_opponent_hand = null
+	_opponent_bet = 1
 
 
 # Advances to the next root. Roots that are a splittable pair (and the engine
@@ -770,18 +1062,24 @@ func _settle_natural(dealer_bj: bool) -> void:
 
 func _play_dealer_and_settle() -> void:
 	_reveal_hole()
-	_dealer.add_card(_hole)
 	var any_standing := false
 	for i in _hands.size():
 		if not _surrendered[i] and not _hands[i].is_bust():
 			any_standing = true
 			break
+	# A real table keeps the dealer playing while any seat stands — including
+	# NPC seats — so a trainee bust doesn't short-circuit the dealer's cards
+	# (the rest of the count stream would be hidden from the player).
+	if not any_standing:
+		for nh in _npc_hands:
+			if not nh.is_bust():
+				any_standing = true
+				break
 	if any_standing:
 		while _dealer_should_hit(_dealer):
 			var dc: CHCard = _deal_card()
 			_dealer.add_card(dc)
 			_reveal(dc, true)
-			card_dealt.emit(dc, true)
 
 	var profit := 0.0
 	var wagered := 0.0
@@ -820,18 +1118,31 @@ func _reveal_hole() -> void:
 	if not _hole_revealed:
 		_reveal(_hole, true)
 		_hole_revealed = true
-		card_dealt.emit(_hole, true)
+		# Append the hole the moment it is revealed, on every settle path. The
+		# natural-settle path (_after_insurance -> _settle_natural) never calls
+		# _play_dealer_and_settle, so without this the revealed hole stays out of
+		# _dealer: the UI renders a one-card "10" and _settle_opponent compares
+		# the rival against a lone upcard instead of the two-card 21. Guarded by
+		# _hole_revealed so the normal settle path (which no longer re-adds it)
+		# still appends it exactly once.
+		_dealer.add_card(_hole)
 
 
 func _finalize(net: float, wagered: float) -> void:
 	_last_net = net
 	_last_wagered = wagered
+	# A backoff hand (forced min bet) is over; the next hand resumes normal play.
+	_backoff_hand = false
 	# Heat decays a fixed amount per settled hand (laying low). The backoff latch
 	# is NOT cleared by decay — only by an explicit new-shoe reset.
 	if config.heat_active:
 		var decayed: float = _heat.on_hand()
 		if decayed > 0.0:
 			heat_changed.emit(_heat.heat)
+	# Settle the tracked opponent's hand against the dealer (venue arc).
+	if opponent != null and _opponent_hand != null and not _opponent_settled:
+		_opponent_settled = true
+		_settle_opponent()
 	# Bankroll update (session-scoped economy). practice mode is no-stake.
 	# Pass the blended session process score (discipline + count accuracy) so the
 	# skill-rating EMA reflects actual session performance (only used on the
@@ -849,16 +1160,40 @@ func _finalize(net: float, wagered: float) -> void:
 		state.set_heat_floor(state.current_tier, _heat.heat)
 		if not state.save():
 			push_error("CHGameLoop: failed to persist tier-%d heat floor (session end)" % state.current_tier)
-	_hands = []
+	# Count-only teaching table (Tier 1): after every hand, quiz the player on the
+	# running count they just tracked. The hand dealt and played itself, so the
+	# count is the only thing the player is responsible for — this is the core
+	# "what to look for" drill. The shoe-cut check is suppressed in this mode
+	# (see start_or_next_shoe) so the player isn't asked twice at the boundary.
+	if config.count_only and config.count_check_active and not ended:
+		_last_shoe_rc = count.running_count
+		_count_check_due = true
+		count_check_due.emit(count.running_count)
+	# Count-only teaching table: the hand dealt and played itself, so keep the
+	# terminal hands AND any NPC hands around for the UI to render — the player
+	# needs to SEE every card (dealer + their own + other seats) to track the
+	# running count. On every other table the hands clear at settle (existing
+	# behaviour). The next round's _deal_opening()/_after_insurance() clear and
+	# rebuild these, so nothing goes stale.
 	_bets = []
 	_surrendered = []
 	_roots = []
 	_root_idx = 0
+	if not config.count_only:
+		_hands = []
+		_npc_hands = []
 	_set_phase(PHASE_SETTLED)
 	hand_settled.emit(net, wagered)
 	if ended:
 		_count_check_due = false
 		session_ended.emit()
+	# A mid-hand cut-change may have completed the FINAL shoe of the session
+	# (on_shoe_finished -> end_session ran mid-hand in _deal_card). Surface
+	# session_ended only now that the hand has settled, so the debrief is not
+	# shown over a live hand.
+	if _shoe_end_deferred:
+		_shoe_end_deferred = false
+		_complete_ended_shoe()
 
 
 func _dealer_should_hit(dealer: CHHand) -> bool:
@@ -870,18 +1205,59 @@ func _dealer_should_hit(dealer: CHHand) -> bool:
 	return true
 
 
+# Heat-tell multiplier: stacking pressure terms. While the player is fully
+# insane their tells register a little more readily (rattled = sloppier); and
+# while they are tilt-detected (loss-chasing) the pit notices (chasing is a
+# classic tell). Each term is 1.0 when inactive, so a calm, non-tilted player
+# always gets exactly the base tell gain.
+const TILT_TELL_MULTIPLIER: float = 1.5
+
+
+func _tell_multiplier() -> float:
+	var mult: float = _mental.heat_link() if _mental.is_insane() else 1.0
+	if discipline.check_tilt():
+		mult *= TILT_TELL_MULTIPLIER
+	return mult
+
+
+# Feeds the mental-stability layer from a bet decision (the bet-ramp half of
+# "process"). Only a mis-sized bet erodes composure — overbetting a cold count
+# reads as tilt, underbetting a hot count as fear — scaled by the deviation
+# severity (1..4 units off -> 0.5 / 0.75 / 1.0) so a 1-off is a nudge and a 4+
+# off is a full lapse. An optimal bet neither erodes nor steadies: composure
+# recovers from correct play calls (the model's contract), so auto-betting an
+# optimal size stays composure-neutral. A declared cover play is an intentional
+# low bet, not a lapse, so it never erodes either. Unconditional (not gated on
+# grade_bet_ramp) — composure is a process read-out, like play calls.
+func _feed_bet_composure(units: int, optimal: int, cover: bool) -> void:
+	if units == optimal or cover:
+		return
+	var diff := absi(units - optimal)
+	var scale: float = 0.5 if diff <= 1 else (0.75 if diff <= 2 else 1.0)
+	_feed_mental(false, scale)
+
+
 # Feeds the mental-stability layer from a graded play decision. A non-optimal
 # play erodes stability (escalating on a streak); a correct play steadies it and
 # resets the streak. Runs unconditionally, like record_decision — it is a
 # presentational read-out, not a scoring lever, so it is not gated on the
 # tier's grade_decisions flag.
-func _feed_mental(correct: bool) -> void:
+func _feed_mental(correct: bool, scale: float = 1.0) -> void:
 	var was_insane: bool = _mental.is_insane()
 	var old_band: String = _mental.mental_state()
 	if correct:
 		_mental.on_success()
 	else:
-		_mental.on_mistake()
+		_mental.on_mistake(scale)
+	_emit_mental_transitions(was_insane, old_band)
+
+
+# Emits the mental-transition signals shared by every path that mutates the
+# mental model (mistake, success, ground). Centralized so grounding — which
+# previously emitted only mental_changed — also fires the band-crossing signals
+# when a recovery crosses out of a band, keeping consumers (vignette, ambient
+# pacing) in sync no matter which path moved the stability.
+func _emit_mental_transitions(was_insane: bool, old_band: String) -> void:
 	if not was_insane and _mental.is_insane():
 		mental_insane.emit()
 	elif was_insane and not _mental.is_insane():
@@ -897,7 +1273,12 @@ func _grade(actual: String, optimal: String) -> void:
 	# "Decisions" line) unconditionally — recording is a process read-out, not a
 	# scoring lever, so it happens even when the tier does not grade.
 	discipline.record_decision(actual, optimal)
-	_feed_mental(actual == optimal)
+	# A correct play steadies composure and a wrong one erodes it — but only for
+	# a *player* call. During auto_play_round the engine makes every call; those
+	# "correct" plays must not steady composure or reset the mistake streak, or
+	# the count-only table's spiral (driven solely by report_count) is masked.
+	if not _engine_play:
+		_feed_mental(actual == optimal)
 	# Decision grading (moving the Discipline meter) is a separate tier-ladder
 	# lever: off on the T1 teaching table, on from T2. Without it the teaching
 	# table penalizes imperfect play just as hard as the hardest table, so the
@@ -926,14 +1307,23 @@ func _deal_card() -> CHCard:
 		# Without this the rest of the hand's I18/insurance decisions and heat
 		# tells would keep using the pre-cut (stale) count.
 		_tc = count.true_count_floor()
-		_on_new_shoe()
+		_on_new_shoe(true)
 		shoe_reshuffled.emit()
 		c = shoe.deal()
 	return c
 
 
-func _reveal(card: CHCard, _is_dealer: bool) -> void:
+func _reveal(card: CHCard, is_dealer: bool) -> void:
 	count.record_card(card)
+	# Keep the cached floored true count live: a real counter updates the count
+	# as each card is revealed, and the sim feeds the live TC (M4). In-hand
+	# decisions (I18 deviations, count-based insurance, heat tells) therefore use
+	# the running count, not a stale hand-start snapshot.
+	_tc = count.true_count_floor()
+	# Every card that becomes visible to the player is a "deal" for SFX/audio:
+	# the opening deal, drawn cards, and the hole reveal all flow through here,
+	# so this is the single choke point the audio layer hooks (M128).
+	card_dealt.emit(card, is_dealer)
 
 
 func _mark_seen(hands: Array[CHHand]) -> void:
@@ -941,6 +1331,10 @@ func _mark_seen(hands: Array[CHHand]) -> void:
 		for c in h.cards:
 			if not c.seen:
 				count.record_card(c)
+				# Split-revealed cards are shown to the player, so they are
+				# deals for SFX purposes too.
+				card_dealt.emit(c, false)
+	_tc = count.true_count_floor()
 
 
 func _set_phase(p: String) -> void:
@@ -974,6 +1368,15 @@ func dealer_hole() -> CHCard:
 	return null
 
 
+# The dealer's full hand (upcard, hole, and any drawn cards) for rendering.
+# Before the hole reveal only the upcard is present; after _reveal_hole the hole
+# is appended and drawn cards follow, so the UI shows the whole hand.
+func dealer_hand() -> CHHand:
+	if _dealer == null:
+		return CHHand.new()
+	return _dealer
+
+
 func current_hand() -> CHHand:
 	if _phase == PHASE_HAND and _idx >= 0 and _idx < _hands.size():
 		return _hands[_idx]
@@ -984,6 +1387,12 @@ func current_hand() -> CHHand:
 
 func all_hands() -> Array[CHHand]:
 	return _hands
+
+
+# NPC player hands this round (auto-played, display only — their P&L is not
+# tracked). Empty on tiers with no NPC players.
+func npc_hands() -> Array[CHHand]:
+	return _npc_hands.duplicate()
 
 
 # The two-card roots dealt at the start of this hand. The scene shows them
@@ -1025,6 +1434,11 @@ func cover_plays_left() -> int:
 	return discipline.cover_plays_left()
 
 
+# Remaining "ground yourself" budget for the current shoe (0..GROUND_USES_PER_SHOE).
+func ground_uses_left() -> int:
+	return _ground_uses_left
+
+
 # --- Heat accessors (see CHHeatSystem) ---
 
 func heat() -> float:
@@ -1037,6 +1451,13 @@ func heat_percent() -> float:
 
 func needs_backoff() -> bool:
 	return _heat.has_pending_backoff()
+
+
+# True while the current hand is a backoff (forced min-bet) hand, i.e. the
+# player was flagged at the end of the previous hand. Lets the UI show a
+# "laying low — minimum bet this hand" indicator and explain the forced bet.
+func is_backoff_hand() -> bool:
+	return _backoff_hand
 
 
 func get_heat_system() -> CHHeatSystem:

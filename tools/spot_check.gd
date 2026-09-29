@@ -26,7 +26,10 @@ func _init() -> void:
 		{"ranks": [2, 8],  "dk": 3,  "expect": "double",  "note": "hard 10 vs 3"},
 		{"ranks": [4, 5],  "dk": 5,  "expect": "double",  "note": "hard 9 vs 5"},
 		# --- Hard-table double/stand/hit boundaries (S17, M56) ---
-		# 13-16: stand vs 2-6, hit vs 7-A. Pin the stand/hit edge at 6/7.
+		# 13-16: 15 stands vs 4-6, hits vs 2-3 and 7-A; 13/14/16 stand vs 2-6.
+		{"ranks": [8, 7],  "dk": 2,  "expect": "hit",     "note": "hard 15 vs 2 (hit)"},
+		{"ranks": [8, 7],  "dk": 3,  "expect": "hit",     "note": "hard 15 vs 3 (hit)"},
+		{"ranks": [8, 7],  "dk": 4,  "expect": "stand",   "note": "hard 15 vs 4 (stand)"},
 		{"ranks": [8, 7],  "dk": 6,  "expect": "stand",   "note": "hard 15 vs 6"},
 		{"ranks": [8, 7],  "dk": 7,  "expect": "hit",     "note": "hard 15 vs 7"},
 		{"ranks": [9, 5],  "dk": 6,  "expect": "stand",   "note": "hard 14 vs 6"},
@@ -101,8 +104,9 @@ func _init() -> void:
 		{"ranks": [7, 7], "dk": 2,   "expect": "split",  "note": "pair 7s vs 2"},
 		{"ranks": [7, 7], "dk": 7,   "expect": "split",  "note": "pair 7s vs 7 (high edge)"},
 		{"ranks": [7, 7], "dk": 8,   "expect": "hit",    "note": "pair 7s vs 8 (not split)"},
-		# 6s: split vs 4-7 only; hit vs 2-3 and 8-A.
-		{"ranks": [6, 6], "dk": 3,   "expect": "hit",    "note": "pair 6s vs 3 (below range)"},
+		# 6s: S17/DAS split vs 2-7; hit vs 8-A.
+		{"ranks": [6, 6], "dk": 2,   "expect": "split",  "note": "pair 6s vs 2 (S17 split)"},
+		{"ranks": [6, 6], "dk": 3,   "expect": "split",  "note": "pair 6s vs 3 (S17 split)"},
 		{"ranks": [6, 6], "dk": 4,   "expect": "split",  "note": "pair 6s vs 4 (low edge)"},
 		{"ranks": [6, 6], "dk": 7,   "expect": "split",  "note": "pair 6s vs 7 (high edge)"},
 		{"ranks": [6, 6], "dk": 8,   "expect": "hit",    "note": "pair 6s vs 8 (above range)"},

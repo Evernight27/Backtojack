@@ -261,6 +261,7 @@ func _check_band_changed_signal() -> void:
 func _make_loop() -> CHGameLoop:
 	var c := CHTableConfig.for_tier(1)
 	c.allows_insurance = false
+	c.opponent = null  # isolate composure mechanics from the social opponent
 	var state := CHGameState.new()
 	state.start_session(1, CHGameState.MODE_PRACTICE)
 	var disc := CHDisciplineSystem.new()

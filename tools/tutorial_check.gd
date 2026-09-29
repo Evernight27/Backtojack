@@ -36,11 +36,14 @@ func _expect(cond: bool, msg: String) -> void:
 
 
 # Fresh tutorial loop with the tutorial table config (mirrors Main.gd's
-# overrides: heat off, count display off) and a throwaway save path.
+# overrides: heat off, count display off, count-only off — the on-ramp teaches
+# betting/play so it must not run as the count-only teaching table) and a
+# throwaway save path.
 func _make_loop(mode: String, tier: int = 1, shoes: int = 3) -> CHGameLoop:
 	var c := CHTableConfig.for_tier(tier)
 	c.heat_active = false
 	c.show_count_display = false
+	c.count_only = false
 	var state := CHGameState.new()
 	state.save_path = TEST_SAVE
 	state.start_session(tier, mode, 0, shoes)

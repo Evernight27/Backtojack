@@ -6,7 +6,7 @@ extends SceneTree
 #   2. for_tier(1) reproduces the teaching-table defaults the sim relies on
 #      (the sim path must stay unchanged).
 #   3. Count systems: per-card values for hi_lo / ko / hi_opt_ii and the
-#      deterministic full-deck net for each (hi_lo=0, ko=+4, hi_opt_ii=-12).
+#      deterministic full-deck net for each (hi_lo=0, ko=+8, hi_opt_ii=0).
 #   4. Loop wiring: a CHGameLoop built from a tier config picks up that
 #      config's count_system, and a multi-deck tier actually builds a
 #      multi-deck shoe.
@@ -16,13 +16,14 @@ extends SceneTree
 const SEED := 20260906
 
 # Full-deck running-count net for each system (52 cards, all seen).
-const DECK_NET := {"hi_lo": 0, "ko": 4, "hi_opt_ii": -12}
+const DECK_NET := {"hi_lo": 0, "ko": 8, "hi_opt_ii": 0}
 
 var _failures: Array[String] = []
 
 
 func _init() -> void:
 	_check_for_tier_sanity()
+	_check_venue_arc()
 	_check_tier1_defaults()
 	_check_count_systems()
 	_check_loop_wiring()
@@ -54,7 +55,26 @@ func _check_for_tier_sanity() -> void:
 		_expect(c.penetration > 0.0 and c.penetration <= 1.0, "for_tier(%d) penetration in (0,1], got %s" % [t, c.penetration])
 		_expect(valid_systems.has(c.count_system), "for_tier(%d) count_system valid, got '%s'" % [t, c.count_system])
 		_expect(c.name != "", "for_tier(%d) name non-empty" % t)
+		_expect(c.venue_name != "", "for_tier(%d) venue_name non-empty" % t)
+		_expect(c.venue_hook != "", "for_tier(%d) venue_hook non-empty" % t)
 		_expect(c.max_split_hands >= 0, "for_tier(%d) max_split_hands>=0" % t)
+
+
+# --- 1b. venue arc: each tier is a distinct place with a narrative hook ---
+func _check_venue_arc() -> void:
+	var seen: Dictionary = {}
+	for t in [1, 2, 3, 4, 5, 6, 7]:
+		var c := CHTableConfig.for_tier(t)
+		if c.venue_name in seen:
+			_failures.append("venue-arc: tier %d venue '%s' duplicates tier %d (must be a distinct place)" % [t, c.venue_name, seen[c.venue_name]])
+		else:
+			seen[c.venue_name] = t
+	# T1 must be the friend-level entry point (no casino, no pit).
+	var t1 := CHTableConfig.for_tier(1)
+	_expect("casino" not in t1.venue_name.to_lower(), "venue-arc: T1 should be a friend/kitchen-level venue, got '%s'" % t1.venue_name)
+	# T7 must be the professional end of the arc (CSS contrast).
+	var t7 := CHTableConfig.for_tier(7)
+	_expect(t7.venue_name != t1.venue_name, "venue-arc: T7 venue must differ from T1")
 
 
 # --- 2. tier 1 reproduces teaching-table / sim-relevant defaults ---
@@ -69,10 +89,17 @@ func _check_tier1_defaults() -> void:
 	_expect(c.split_aces_one_card_only, "T1 split aces one-card-only")
 	_expect(c.allows_double_after_split, "T1 DAS")
 	_expect(not c.allows_surrender, "T1 no surrender")
+	_expect(c.npc_players == 0, "T1 has no NPC players (pure counting drill), got %d" % c.npc_players)
+	# NPC player seats ramp up with the tier (a busier table = a richer visible
+	# counting stream) and never exceed the physical seat count.
+	_expect(CHTableConfig.for_tier(2).npc_players == 1, "T2 1 NPC, got %d" % CHTableConfig.for_tier(2).npc_players)
+	_expect(CHTableConfig.for_tier(4).npc_players == 2, "T4 2 NPCs, got %d" % CHTableConfig.for_tier(4).npc_players)
+	_expect(CHTableConfig.for_tier(6).npc_players == 3, "T6 3 NPCs, got %d" % CHTableConfig.for_tier(6).npc_players)
 	_expect(absf(c.penetration - 0.70) < 1e-6, "T1 penetration 0.70, got %s" % c.penetration)
 	_expect(absf(c.deck_estimation_rounding - 1.0) < 1e-6, "T1 est rounding 1.0, got %s" % c.deck_estimation_rounding)
 	_expect(c.heat_active, "T1 heat_active")
 	_expect(c.show_count_display, "T1 show_count_display")
+	_expect(c.count_only, "T1 count_only (teaching table is a pure counting drill)")
 	_expect(c.count_system == "hi_lo", "T1 hi_lo, got %s" % c.count_system)
 
 
@@ -83,13 +110,16 @@ func _check_count_systems() -> void:
 	_expect(CHCard.new("S", 7).count_value("hi_lo") == 0, "hi_lo 7 = 0")
 	_expect(CHCard.new("S", 10).count_value("hi_lo") == -1, "hi_lo 10 = -1")
 	_expect(CHCard.new("S", 14).count_value("hi_lo") == -1, "hi_lo A = -1")
+	_expect(CHCard.new("S", 7).count_value("ko") == 1, "ko 7 = +1")
+	_expect(CHCard.new("S", 8).count_value("ko") == 0, "ko 8 = 0")
 	_expect(CHCard.new("S", 14).count_value("ko") == 0, "ko A = 0")
 	_expect(CHCard.new("S", 10).count_value("ko") == -1, "ko 10 = -1")
 	_expect(CHCard.new("S", 4).count_value("hi_opt_ii") == 1, "hi_opt_ii 4 = +1")
 	_expect(CHCard.new("S", 5).count_value("hi_opt_ii") == 0, "hi_opt_ii 5 = 0")
-	_expect(CHCard.new("S", 8).count_value("hi_opt_ii") == -1, "hi_opt_ii 8 = -1")
+	_expect(CHCard.new("S", 8).count_value("hi_opt_ii") == 0, "hi_opt_ii 8 = 0")
 	_expect(CHCard.new("S", 10).count_value("hi_opt_ii") == -1, "hi_opt_ii 10 = -1")
-	_expect(CHCard.new("S", 14).count_value("hi_opt_ii") == 0, "hi_opt_ii A = 0")
+	_expect(CHCard.new("S", 11).count_value("hi_opt_ii") == 0, "hi_opt_ii J = 0")
+	_expect(CHCard.new("S", 14).count_value("hi_opt_ii") == -1, "hi_opt_ii A = -1")
 
 	# Full-deck net for each system (deterministic; documents each system's bias).
 	for sys in DECK_NET.keys():

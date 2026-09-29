@@ -64,8 +64,9 @@ func _soak_tier(tier: int, expected_spots: int) -> void:
 	var split_rounds := 0
 	var stuck := false
 	var round := 0
+	var max_iter := HANDS_PER_TIER * 10  # safety guard
 
-	while rounds < HANDS_PER_TIER:
+	while rounds < HANDS_PER_TIER and round < max_iter:
 		round += 1
 		if not loop.begin_hand():
 			_failures.append("T%d: begin_hand failed at round %d (session ended early)" % [tier, round])

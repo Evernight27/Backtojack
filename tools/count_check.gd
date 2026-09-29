@@ -14,6 +14,12 @@ extends SceneTree
 #      second report is a no-op.
 #   6. Skip — skip_count_check() declines the prompt: clears the due flag and
 #      records no check, so a declining player is not penalized.
+#   7. Implausible report — an RC beyond the shoe's card count is rejected
+#      (check stays due) instead of recording a 0-score.
+#   8. Count-only rating — on the count-only teaching table the process score
+#      is the count accuracy alone (no discipline padding), so the skill rating
+#      is alpha * accuracy, strictly below the discipline-padded blend a real
+#      table would give for the same counting.
 #
 # PASS == all checks succeed. Exit 0 on pass, 1 on any fail.
 
@@ -33,6 +39,7 @@ func _init() -> void:
 	_check_running_mean()
 	_check_no_check_neutral()
 	_check_blend_pulls_rating_down()
+	_check_count_only_rating_is_count_accuracy()
 	_check_cut_signal_and_idempotency()
 	_check_skip_clears_check()
 	_check_rejects_implausible_report()
@@ -132,6 +139,7 @@ func _drive_hands(loop: CHGameLoop, bad_offset: int) -> void:
 func _make_loop(count_check: bool) -> CHGameLoop:
 	var c := CHTableConfig.for_tier(1)
 	c.count_check_active = count_check
+	c.opponent = null  # isolate count-accuracy mechanics from the social opponent
 	var state := CHGameState.new()
 	# 2 shoes: the session survives the first cut (so the check can be reported)
 	# and ends at the second.
@@ -253,6 +261,30 @@ func _check_rejects_implausible_report() -> void:
 	var ok: Dictionary = loop.report_count(loop.last_shoe_rc())
 	_expect(not ok.is_empty(), "implausible: a valid report still succeeds")
 	_expect(not loop.is_count_check_due(), "implausible: check cleared after valid report")
+
+
+# --- 8. Count-only rating is pure count accuracy (no discipline padding) ---
+# On a count-only table the player made no play decisions, so discipline is
+# pinned at 100 and is not a skill signal. The process score must be the count
+# accuracy alone; the skill rating (single EMA step from 0.0) should equal
+# SKILL_EMA_ALPHA * accuracy, NOT lerpf(100, accuracy, 0.5).
+func _check_count_only_rating_is_count_accuracy() -> void:
+	var loop := _make_loop(true)  # T1: count_only=true, count_check_active=true
+	var st: CHGameState = loop.state
+	_drive_hands(loop, -8)  # report RC off by 8 at every cut (score 60 each)
+	_expect(not st.is_session_active(), "count-only rating: session ended")
+	var acc: float = loop.get_count_accuracy().accuracy
+	var checks: int = loop.get_count_accuracy().checks
+	_expect(checks > 0, "count-only rating: checks were recorded, got %d" % checks)
+	var rating: float = st.get_skill_rating()
+	var expected: float = CHGameState.SKILL_EMA_ALPHA * acc
+	_expect(absf(rating - expected) < 0.01,
+		"count-only rating = alpha*accuracy (%.2f), got %.2f" % [expected, rating])
+	# The old blended formula would give a higher rating; assert we are NOT on
+	# that path.
+	var blended: float = CHGameState.SKILL_EMA_ALPHA * lerpf(100.0, acc, 0.5)
+	_expect(rating < blended - 0.01,
+		"count-only rating (%.2f) is below the discipline-padded blend (%.2f)" % [rating, blended])
 
 
 func _finish() -> void:

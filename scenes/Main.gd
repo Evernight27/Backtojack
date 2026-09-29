@@ -24,10 +24,13 @@ var _cover_label: Label
 var _heat_label: Label
 var _count_system_label: Label
 var _tilt_label: Label
+var _opponent_label: Label
+var _opponent_busted: bool = false
 var _tier_selector: OptionButton
 var _mode_selector: OptionButton
 var _shoes_spin: SpinBox
 var _deal_button: Button
+var _ground_button: Button
 var _cash_out_button: Button
 var _new_session_button: Button
 # Session parameters the scene applies when it (re)starts a session.
@@ -36,6 +39,7 @@ var _shoes: int = 3
 var _debrief_panel: PanelContainer
 var _debrief_title: Label
 var _debrief_lines: Array[Label] = []
+var _debrief_lines_box: VBoxContainer
 var _skill_before_session: float = 0.0
 var _unlocked_before_session: int = 1
 var _session_net: float = 0.0
@@ -49,14 +53,19 @@ var _count_acc_label: Label
 # this session. Recorded unconditionally (independent of the grade_decisions
 # tier lever), so the T1 teaching table gets live accuracy feedback too.
 var _decision_acc_label: Label
+# Live mistake run (leading indicator of the composure spiral). Shown only while
+# a run is in progress (resets to 0 on the next correct play) — a discrete
+# play-quality streak, not a composure meter, so it does not break the "mental
+# state is hidden" rule. Mirrors the debrief's "worst run ×N" vocabulary.
+var _run_label: Label
 var _skill_label: Label
 var _count_check_panel: PanelContainer
 var _count_check_title: Label
 var _count_check_input: LineEdit
 var _count_check_submit: Button
 var _count_check_skip: Button
-# Onboarding (M84): a full-rect help/intro overlay shown on first launch and
-# reachable any time via the Help button / F1.
+# Onboarding (M84/M130): a full-rect help/intro overlay reachable any time via
+# the Help button / F1. No longer auto-shown on first launch (M130).
 var _help_panel: PanelContainer
 var _help_button: Button
 # Career & stats (M92): a full-rect overlay surfacing persistent progression —
@@ -68,6 +77,12 @@ var _stats_button: Button
 var _thought_label: Label
 var _thought_tween: Tween
 var _last_thought_ts: int = 0
+# Previous mental stability (for detecting a drop on mental_changed) and the
+# red vignette that fades in as the player's composure degrades (fraying/insane).
+var _last_mental_stability: float = -1.0
+var _vignette: TextureRect
+var _vignette_tween: Tween
+var _audio: CHAudioSystem
 # Tutorial (M116): guided on-ramp. A single "Next" control that auto-plays what
 # the current stage has not taught yet, plus a stage indicator label.
 var _tutorial_next_button: Button
@@ -82,7 +97,12 @@ var _tutorial_count_results: Array = []
 # Set in _on_count_check_due (after the shoe boundary has already advanced
 # shoes_this_session, so the stage that just ended is current-1).
 var _pending_count_check_stage: int = 1
-const THOUGHT_COOLDOWN_SEC := 8
+# Intrusive-thought cooldown (seconds), continuous rather than fixed: the deeper
+# the player is in the mental spiral, the more frequent the thoughts. The value
+# is lerped between these bounds by the model's depth() each time a fraying/
+# insane band-change fires, so escalation tracks the per-tier mental profile.
+const THOUGHT_COOLDOWN_MAX_SEC := 12.0
+const THOUGHT_COOLDOWN_MIN_SEC := 2.0
 const THOUGHTS := [
 	"You're miscounting. You've been miscounting the whole time.",
 	"The floor is watching you.",
@@ -104,9 +124,6 @@ const START_TARGET := 150
 func _ready() -> void:
 	_build_ui()
 	_start_session(1, _mode, START_TARGET, _shoes)
-	# First launch (no save file on disk): surface the intro so the player
-	# learns the trainer's goals before the first hand.
-	_maybe_show_intro()
 
 
 # --- Session lifecycle ---
@@ -127,8 +144,12 @@ func _start_session(tier: int, mode: String, target: int, shoes: int) -> void:
 		# pressure while learning) and the count display off — the player must
 		# track the running count themselves, and the shoe-cut count check grades
 		# it. (for_tier returns a fresh resource, so these overrides are safe.)
+		# The on-ramp also teaches betting (stage 2) and play decisions (stage 3),
+		# so it disables the count-only mode that the Tier 1 teaching table runs
+		# by default — otherwise the guided stages would have nothing to teach.
 		config.heat_active = false
 		config.show_count_display = false
+		config.count_only = false
 	_loop = CHGameLoop.new(config, _state, _discipline, -1)
 	_state.start_session(tier, mode, target, shoes)
 	_mode = mode
@@ -137,6 +158,7 @@ func _start_session(tier: int, mode: String, target: int, shoes: int) -> void:
 	_unlocked_before_session = _state.highest_unlocked_tier()
 	_session_net = 0.0
 	_save_failed_this_session = false
+	_opponent_busted = false
 	_debrief_panel.visible = false
 	_new_session_button.visible = false
 	_status_label.text = ""
@@ -155,6 +177,13 @@ func _start_session(tier: int, mode: String, target: int, shoes: int) -> void:
 		_thought_tween = null
 	_thought_label.visible = false
 	_thought_label.modulate.a = 1.0
+	# Reset mental composure tracking + vignette for the new session.
+	_last_mental_stability = -1.0
+	if _vignette_tween != null:
+		_vignette_tween.kill()
+		_vignette_tween = null
+	if _vignette != null:
+		_vignette.modulate.a = 0.0
 	# Same for the tutorial stage-unlock banner (M117); the stage tracker resets
 	# so the new session's first advance re-announces cleanly.
 	if _tutorial_banner_tween != null:
@@ -169,12 +198,24 @@ func _start_session(tier: int, mode: String, target: int, shoes: int) -> void:
 	_populate_mode_selector()
 	_loop.shoe_reshuffled.connect(func(): _refresh_all())
 	_loop.hand_settled.connect(_on_hand_settled)
+	_loop.card_dealt.connect(func(_card, _is_dealer): _audio.play_deal())
 	_loop.decision_graded.connect(func(_delta: float, _v: float): _refresh_hud())
 	_loop.session_ended.connect(_on_session_ended)
 	_loop.heat_backoff.connect(_on_heat_backoff)
 	_loop.count_check_due.connect(_on_count_check_due)
 	_loop.save_failed.connect(_on_save_failed)
 	_loop.mental_band_changed.connect(_on_mental_band_changed)
+	_loop.mental_changed.connect(_on_mental_changed)
+	_loop.opponent_settled.connect(_on_opponent_settled)
+	_loop.opponent_busted.connect(_on_opponent_busted)
+	# Venue-arc framing (M122): announce the place you are sitting at when a
+	# session starts — the "vs a friend -> vs a casino" journey. Venue name plus
+	# its narrative hook; both empty in headless/test configs, so nothing shows.
+	if _loop.config.venue_name != "":
+		var venue_line: String = _loop.config.venue_name
+		if _loop.config.venue_hook != "":
+			venue_line += " — " + _loop.config.venue_hook
+		_show_session_banner(venue_line)
 	_refresh_all()
 
 
@@ -256,7 +297,9 @@ func _populate_tier_selector() -> void:
 	for t in 7:
 		var tier := t + 1
 		if tier <= unlocked:
-			_tier_selector.add_item("Tier %d — %s" % [tier, CHTableConfig.for_tier(tier).name])
+			var vc: CHTableConfig = CHTableConfig.for_tier(tier)
+			var display: String = vc.venue_name if vc.venue_name != "" else vc.name
+			_tier_selector.add_item("Tier %d — %s" % [tier, display])
 	# Clamp to the actual item count: if current_tier somehow exceeds the number
 	# of unlocked tiers (e.g. a stale value after a save reload), select() would
 	# throw "index out of bounds". Fall back to the top available tier.
@@ -274,6 +317,10 @@ func _on_tier_selected(index: int) -> void:
 
 
 func _on_hand_settled(net: float, _wagered: float) -> void:
+	if net > 0.0:
+		_audio.play_win()
+	elif net < 0.0:
+		_audio.play_loss()
 	# Accumulate the per-hand integer exactly the way the bankroll does
 	# (apply_hand_result rounds each hand's net to an int). Rounding the raw
 	# floats and summing them at the end would diverge from the real bankroll
@@ -283,6 +330,11 @@ func _on_hand_settled(net: float, _wagered: float) -> void:
 	# Session-end UI is driven by the loop's session_ended signal (covers every
 	# end path: target/bust via this hand, and practice/survival via shoe
 	# completion), so no duplicate handling here.
+	# Count-only teaching table: the hand auto-played, so P&L is not the point —
+	# the status line reinforces that the player's job is the running count.
+	if _loop.config.count_only:
+		_status_label.text = "Auto-played hand — report your running count."
+		return
 	var status_msg: String = "Hand settled: %+d" % int(roundf(net))
 	# In the guided tutorial stages the player advances by pressing Next; nudge
 	# them so they know the hand is done and they can continue.
@@ -292,10 +344,8 @@ func _on_hand_settled(net: float, _wagered: float) -> void:
 
 
 func _on_session_ended() -> void:
-	# Record that the player has trained on this tier's counting system so the
-	# career screen can list which systems they've played (progression record,
-	# not a selector — the tier still dictates the active system).
-	_state.unlock_system(_loop.config.count_system)
+	# The session's counting system is recorded by CHGameState.end_session (before
+	# its save), so it persists in the same write as the session stats.
 	var reason := _state.last_end_reason
 	var msg := "Session ended: %s" % _reason_text(reason)
 	if reason == "bust":
@@ -308,6 +358,10 @@ func _on_session_ended() -> void:
 	_new_session_button.visible = true
 	_show_debrief(reason)
 	_refresh_all()
+	# Skill rating / lifetime stats change at session end (end_session EMA update);
+	# refresh an open stats overlay so it doesn't show the pre-session values.
+	if _stats_panel.visible:
+		_populate_stats()
 
 
 # The loop's session-end save could not be written. Remember it so the
@@ -317,24 +371,42 @@ func _on_save_failed() -> void:
 
 
 func _on_heat_backoff() -> void:
-	# The player was flagged as backed off; heat resets to the tier floor and they
-	# are re-seated. Surface a transient notice (overwritten by the next settle).
-	_status_label.text = "Backed off — heat reset to the tier floor."
+	# The player was flagged as backed off; heat resets to the tier floor and
+	# they're re-seated. This hand is a "backoff hand": the bet is forced to the
+	# minimum (optimal_bet_units returns 1) so the pit sees them laying low.
+	_status_label.text = "Backed off — minimum bet this hand, heat reset to the tier floor."
 	_refresh_all()
+
+
+func _on_opponent_settled(_net: float) -> void:
+	_refresh_hud()
+
+
+func _on_opponent_busted() -> void:
+	_opponent_busted = true
+	_refresh_hud()
 
 
 # --- Count-check prompt (M16) ---
 
 func _on_count_check_due(_rc: int) -> void:
-	# A shoe just cut; ask the player for the running count they tracked.
+	# Ask the player for the running count they tracked. On the Tier 1 count-only
+	# drill this fires after every hand; on every other tier it fires at a shoe
+	# cut (the shoe boundary has already advanced shoes_this_session).
 	# In a tutorial, tag which stage this check belongs to so the debrief can
-	# break counting accuracy down per stage. The shoe boundary has already
-	# advanced shoes_this_session, so the stage that just ended is current-1.
+	# break counting accuracy down per stage; the stage that just ended is current-1.
 	if _state.session_mode == CHGameState.MODE_TUTORIAL:
 		_pending_count_check_stage = maxi(_loop.tutorial_stage() - 1, 1)
-	_count_check_title.text = "Shoe cut — what's your running count? (Enter to submit)"
+	# Count-only teaching table (Tier 1) quizzes after every hand, not only at a
+	# shoe cut, so phrase the prompt for the hand; every other tier quizzes at a
+	# shoe cut.
+	_count_check_title.text = (
+		"What's your running count? (Enter to submit)"
+		if _loop.config.count_only
+		else "Shoe cut — what's your running count? (Enter to submit)"
+	)
 	_count_check_input.text = ""
-	_count_check_input.placeholder_text = "running count (e.g. 4, -2)"
+	_count_check_input.placeholder_text = "running count (e.g. +3, -2)"
 	_count_check_panel.visible = true
 	_count_check_input.grab_focus()
 	_refresh_all()
@@ -364,9 +436,13 @@ func _on_count_check_submit() -> void:
 		return
 	# Surface the result in the status line so the player always sees their score,
 	# even though the prompt panel is now closed.
-	_status_label.text = "Count: you said %d, actual was %d (off by %d). Score: %.0f/100." % [
-		int(r.get("reported", 0)), int(r.get("actual", 0)),
-		int(r.get("abs_error", 0)), float(r.get("score", 0.0))]
+	if int(r.get("abs_error", -1)) == 0:
+		_status_label.text = "Count: correct (you said %d). Score: %.0f/100." % [
+			int(r.get("reported", 0)), float(r.get("score", 0.0))]
+	else:
+		_status_label.text = "Count: you said %d, actual was %d (off by %d). Score: %.0f/100." % [
+			int(r.get("reported", 0)), int(r.get("actual", 0)),
+			int(r.get("abs_error", 0)), float(r.get("score", 0.0))]
 	# Record per-stage count results for the tutorial debrief (M120).
 	if _state.session_mode == CHGameState.MODE_TUTORIAL:
 		_tutorial_count_results.append({
@@ -428,8 +504,10 @@ func _show_debrief(reason: String) -> void:
 		pnl_suffix = "bankroll %d" % final_bankroll
 	var career_hands: int = int(_state.lifetime_stats.get("hands_played", 0))
 	var career_sessions: int = int(_state.lifetime_stats.get("sessions_played", 0))
+	var table_cfg: CHTableConfig = CHTableConfig.for_tier(_state.current_tier)
+	var table_display: String = table_cfg.venue_name if table_cfg.venue_name != "" else table_cfg.name
 	var lines: Array[String] = [
-		"Table:  Tier %d — %s" % [_state.current_tier, CHTableConfig.for_tier(_state.current_tier).name],
+		"Table:  Tier %d — %s" % [_state.current_tier, table_display],
 		"Hands:  %d    Shoes:  %d" % [_state.hands_this_session, _state.shoes_this_session],
 		"Discipline:  %.0f / 100" % _discipline.discipline,
 		"P&L:  %+.1f units  (%s)" % [_session_net, pnl_suffix],
@@ -438,24 +516,52 @@ func _show_debrief(reason: String) -> void:
 			career_hands, "" if career_hands == 1 else "s",
 			career_sessions, "" if career_sessions == 1 else "s"],
 	]
-	if _discipline.session_decisions > 0:
+	if not _loop.config.count_only and _discipline.session_decisions > 0:
 		lines.append("Decisions:  %d / %d optimal" % [
 			_discipline.session_optimal, _discipline.session_decisions])
 	var acc: CHCountAccuracySystem = _loop.get_count_accuracy()
+	# Composure read-out (the "going insane" spiral). Shown whenever the player
+	# actually drove composure: real play decisions, or the count-only teaching
+	# drill (where miscounts are what erode it). Lowest composure reached + the
+	# longest mistake run this session.
+	if _discipline.session_decisions > 0 or acc.checks > 0:
+		var _m: CHMentalStateSystem = _loop.get_mental_system()
+		lines.append("Composure:  lowest %.0f%%  ·  worst run ×%d" % [
+			_m.min_stability, _m.max_mistake_streak])
 	if _loop.config.count_check_active and acc.checks > 0:
 		if _state.session_mode == CHGameState.MODE_TUTORIAL:
-			# M120: break counting down per stage in the on-ramp debrief.
+			# M120: break counting down per stage in the on-ramp debrief, and
+			# keep the overall accuracy alongside it — the per-stage numbers alone
+			# hide the aggregate score the skill rating actually feeds from.
 			var summary: String = _tutorial_counting_summary()
-			lines.append(summary if summary != "" else "Counting:  %.0f / 100  (%d checks)" % [acc.accuracy, acc.checks])
+			if summary != "":
+				lines.append(summary + "  |  overall %.0f%% over %d check%s" % [acc.accuracy, acc.checks, "" if acc.checks == 1 else "s"])
+			else:
+				lines.append("Counting:  %.0f / 100  (%d checks)" % [acc.accuracy, acc.checks])
 		else:
 			lines.append("Counting:  %.0f / 100  (%d check%s)" % [acc.accuracy, acc.checks, "" if acc.checks == 1 else "s"])
 	if highest_now > _unlocked_before_session:
-		lines.append("Unlocked:  Tier %d — %s" % [highest_now, CHTableConfig.for_tier(highest_now).name])
+		var unlock_cfg: CHTableConfig = CHTableConfig.for_tier(highest_now)
+		var unlock_display: String = unlock_cfg.venue_name if unlock_cfg.venue_name != "" else unlock_cfg.name
+		lines.append("Unlocked:  Tier %d — %s" % [highest_now, unlock_display])
 	else:
-		lines.append("Highest unlocked tier:  %d" % highest_now)
+		var top_cfg: CHTableConfig = CHTableConfig.for_tier(highest_now)
+		var top_display: String = top_cfg.venue_name if top_cfg.venue_name != "" else top_cfg.name
+		lines.append("Highest unlocked tier:  %d — %s" % [highest_now, top_display])
 	_debrief_title.text = "Session ended — %s" % _reason_text(reason)
+	# Match the label pool to the exact line count so every line renders. The
+	# count varies with the session (optional decisions/composure/counting
+	# lines), so a fixed pool would silently clip the trailing lines — notably
+	# the "Unlocked / Highest unlocked tier" progression line on tier 2+.
+	while _debrief_lines.size() > lines.size():
+		_debrief_lines.pop_back().free()
+	while _debrief_lines.size() < lines.size():
+		var l := Label.new()
+		l.add_theme_font_size_override("font_size", 15)
+		_debrief_lines_box.add_child(l)
+		_debrief_lines.append(l)
 	for i in _debrief_lines.size():
-		_debrief_lines[i].text = lines[i] if i < lines.size() else ""
+		_debrief_lines[i].text = lines[i]
 	_debrief_panel.visible = true
 
 
@@ -523,11 +629,16 @@ func _build_ui() -> void:
 	# session. Shown on every tier — the record is unconditional, so even the
 	# teaching table (grading off) gets live accuracy feedback.
 	_decision_acc_label = _hud_label(hud, "Decisions: ")
+	# Live mistake run (leading indicator of the composure spiral). Hidden while the
+	# player is clean; a discrete play-quality streak, not a composure meter.
+	_run_label = _hud_label(hud, "")
 	# Note: the mental-stability layer (CHMentalStateSystem) is intentionally not
 	# surfaced in the HUD. It is a hidden, process-consistency signal intended to
 	# drive ambient effects (see mental_band_changed) rather than a visible meter.
 	# Live count details (shown only when the tier's count display is on).
 	_count_system_label = _hud_label(hud, "")
+	_opponent_label = _hud_label(hud, "")
+	_opponent_label.visible = false
 	# Tier selector: lets you sit at any unlocked tier's table.
 	_tier_selector = OptionButton.new()
 	_tier_selector.add_theme_font_size_override("font_size", 16)
@@ -579,16 +690,12 @@ func _build_ui() -> void:
 	var debrief_vbox := VBoxContainer.new()
 	debrief_vbox.add_theme_constant_override("separation", 4)
 	_debrief_panel.add_child(debrief_vbox)
+	_debrief_lines_box = debrief_vbox
 	_debrief_title = Label.new()
 	_debrief_title.add_theme_font_size_override("font_size", 20)
 	debrief_vbox.add_child(_debrief_title)
-	# 9 lines: table, hands, discipline, P&L, skill, career, decisions
-	# (optional), counting (optional), unlock.
-	for i in 9:
-		var l := Label.new()
-		l.add_theme_font_size_override("font_size", 15)
-		debrief_vbox.add_child(l)
-		_debrief_lines.append(l)
+	# Debrief line labels are created on demand by _show_debrief to match the
+	# actual line count, so a varying number of lines can never clip the last.
 
 	# Status
 	_status_label = Label.new()
@@ -623,6 +730,15 @@ func _build_ui() -> void:
 	_deal_button.text = "Deal Next Hand (Space)"
 	_deal_button.pressed.connect(_on_deal)
 	actions.add_child(_deal_button)
+
+	# Ground (composure recovery): a between-hands action, shown only when idle
+	# and uses remain. Kept out of _action_buttons so the per-hand action gating
+	# (show_actions) does not hide it during play; its own gate lives in
+	# _refresh_actions.
+	_ground_button = Button.new()
+	_ground_button.text = "Ground (G)"
+	_ground_button.pressed.connect(_on_ground)
+	actions.add_child(_ground_button)
 
 	# Tutorial (M116): single advance control for the guided on-ramp. In stage 1
 	# it starts the hand and auto-plays it so the player only counts; in stage 2
@@ -714,6 +830,12 @@ func _build_ui() -> void:
 	# Intrusive-thought overlay (M114). Added last so it draws above every panel.
 	_build_thought_label()
 	_build_tutorial_banner()
+	# Red composure vignette: topmost overlay, faded in/out by the mental band.
+	_build_vignette()
+	# Procedural SFX (deal/win/loss) + ambient mood. Headless-safe (no-op in the
+	# test suite), so always safe to instantiate.
+	_audio = CHAudioSystem.new()
+	add_child(_audio)
 
 
 func _build_help_panel() -> void:
@@ -818,8 +940,8 @@ func _build_thought_label() -> void:
 
 # Tutorial stage-transition banner (M117). A prominent one-line cue that fades in
 # when a new stage unlocks (stage 2, stage 3) — the on-ramp's pivotal moments.
-# Sits just below the intrusive-thought label so the two never overlap. Hidden
-# until a transition fires.
+# Vertically centered on screen (M131) so it never overlaps the top HUD readouts.
+# Hidden until a transition fires.
 func _build_tutorial_banner() -> void:
 	_tutorial_banner = Label.new()
 	_tutorial_banner.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -828,16 +950,24 @@ func _build_tutorial_banner() -> void:
 	_tutorial_banner.add_theme_color_override("font_shadow_color", Color(0, 0, 0, 0.75))
 	_tutorial_banner.add_theme_constant_override("shadow_offset_x", 1)
 	_tutorial_banner.add_theme_constant_override("shadow_offset_y", 1)
-	_tutorial_banner.set_anchors_preset(Control.PRESET_CENTER_TOP)
-	_tutorial_banner.offset_top = 24
-	_tutorial_banner.offset_bottom = 56
+	# Full-rect region: the label spans the whole screen (with side margins) and
+	# vertically centers its text within that region, so it never overlaps the
+	# top HUD readouts.
+	_tutorial_banner.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_tutorial_banner.offset_left = 80
+	_tutorial_banner.offset_right = -80
+	_tutorial_banner.offset_top = 0
+	_tutorial_banner.offset_bottom = 0
+	_tutorial_banner.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_tutorial_banner.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	_tutorial_banner.visible = false
 	add_child(_tutorial_banner)
 
 
-# Shows the stage banner with a fade-in / hold / fade-out. Instructional, so it
-# holds longer than an ambient thought and never blocks input.
-func _show_tutorial_banner(text: String) -> void:
+# Shows a session banner with a fade-in / hold / fade-out. Used for the
+# stage-unlock announcements and the session-start venue framing. Never blocks
+# input.
+func _show_session_banner(text: String) -> void:
 	_tutorial_banner.text = text
 	_tutorial_banner.modulate.a = 0.0
 	_tutorial_banner.visible = true
@@ -873,17 +1003,87 @@ func _show_thought(text: String) -> void:
 		_thought_label.visible = false)
 
 
-# Fires when the hidden sanity band changes (M114). Surfaces an ambient
-# intrusive thought when the band degrades; cooldown keeps it from spamming
-# if the player flaps between fraying/strained. No player-facing meter.
+# Fires when the hidden sanity band changes (M114). Drives the red vignette:
+# it fades in as composure degrades to fraying/insane and fades out as the
+# player recovers to calm/strained. No player-facing meter — just the world
+# reddening around the edges as the spiral takes hold.
 func _on_mental_band_changed(_old_band: String, new_band: String) -> void:
-	if new_band not in [CHMentalStateSystem.STATE_FRAYING, CHMentalStateSystem.STATE_INSANE]:
+	_update_vignette(new_band)
+	if _audio:
+		_audio.set_band(new_band)
+
+
+# Continuous thought pacing: fires on every mental_changed (i.e. every
+# composure change from a mistake, bet, or count miss). A thought surfaces only
+# when stability just DROPPED (a lapse, not a recovery), the player is in the
+# fraying/insane band, and the depth-scaled cooldown has elapsed. This is what
+# makes the spiral feel continuous — a player sinking deep gets thoughts on
+# nearly every miss, while one barely frayed gets them rarely.
+func _on_mental_changed(stability: float) -> void:
+	# Keep the live mistake-run tag in sync on every composure change (a bet
+	# lapse changes the streak *before* any hand event would otherwise refresh).
+	_refresh_run_label()
+	var decreased: bool = _last_mental_stability >= 0.0 and stability < _last_mental_stability
+	_last_mental_stability = stability
+	if not decreased:
 		return
-	var now: int = Time.get_ticks_msec() / 1000
-	if now - _last_thought_ts < THOUGHT_COOLDOWN_SEC:
+	var band: String = _loop.get_mental_system().mental_state()
+	if band != CHMentalStateSystem.STATE_FRAYING and band != CHMentalStateSystem.STATE_INSANE:
+		return
+	var now: int = int(Time.get_ticks_msec() / 1000.0)
+	var cooldown: int = int(_thought_cooldown_sec())
+	if now - _last_thought_ts < cooldown:
 		return
 	_last_thought_ts = now
 	_show_thought(THOUGHTS.pick_random())
+
+
+# Deeper in the spiral -> shorter cooldown -> more frequent intrusive thoughts.
+# Reads the model's depth() (0 calm .. 1 deep insane) so the pacing follows the
+# per-tier profile instead of a hard-coded 8s.
+func _thought_cooldown_sec() -> float:
+	return lerp(THOUGHT_COOLDOWN_MAX_SEC, THOUGHT_COOLDOWN_MIN_SEC, _loop.get_mental_system().depth())
+
+
+# Tints the screen edges red in proportion to how far the player has fallen.
+# calm/strained -> no tint, fraying -> light, insane -> strong.
+func _update_vignette(new_band: String) -> void:
+	var target: float = 0.0
+	if new_band == CHMentalStateSystem.STATE_INSANE:
+		target = 0.9
+	elif new_band == CHMentalStateSystem.STATE_FRAYING:
+		target = 0.5
+	if _vignette == null:
+		return
+	if _vignette_tween != null:
+		_vignette_tween.kill()
+	_vignette_tween = create_tween()
+	_vignette_tween.tween_property(_vignette, "modulate:a", target, 0.8)
+
+
+# Builds the red vignette (a radial gradient texture, transparent at the centre
+# darkening red toward the edges) as a full-rect overlay that fades in/out via
+# modulate alpha. Built last so it sits above the table; modulate alpha is 0
+# until composure degrades, so it never tints the normal play.
+func _build_vignette() -> void:
+	_vignette = TextureRect.new()
+	_vignette.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_vignette.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_vignette.expand = TextureRect.EXPAND_IGNORE_SIZE
+	_vignette.stretch_mode = TextureRect.STRETCH_SCALE
+	_vignette.modulate.a = 0.0
+	var grad := Gradient.new()
+	grad.offsets = [0.0, 0.62, 1.0]
+	grad.colors = [Color(0.35, 0.0, 0.0, 0.0), Color(0.35, 0.0, 0.0, 0.05), Color(0.42, 0.0, 0.0, 0.62)]
+	var tex := GradientTexture2D.new()
+	tex.gradient = grad
+	tex.fill = GradientTexture2D.FILL_RADIAL
+	tex.fill_from = Vector2(0.5, 0.5)
+	tex.fill_to = Vector2(1.0, 1.0)
+	tex.width = 1024
+	tex.height = 1024
+	_vignette.texture = tex
+	add_child(_vignette)
 
 
 func _show_stats() -> void:
@@ -944,22 +1144,31 @@ func _counting_systems_text() -> String:
 	return ", ".join(out) if out.size() > 0 else "none yet"
 
 
-# Human note on how close the rating is to the next tier unlock.
+# Human note on how close the rating is to the next tier unlock, named in
+# venue terms (the arc: kitchen table -> rec room -> card room -> casino ->
+# pro circuit) so the readout matches the session flow.
 func _next_tier_note(_rating: float) -> String:
 	var h: int = _state.highest_unlocked_tier()
 	if h >= CHGameState.TIER_SKILL_THRESHOLDS.size():
 		return "max tier reached"
+	var next_tier: int = h + 1
+	var next_cfg: CHTableConfig = CHTableConfig.for_tier(next_tier)
+	var next_name: String = next_cfg.venue_name if next_cfg.venue_name != "" else next_cfg.name
 	var next_thr: float = CHGameState.TIER_SKILL_THRESHOLDS[h]
-	return "T%d unlocks at %.0f" % [h + 1, next_thr]
+	return "%s (T%d) unlocks at %.0f" % [next_name, next_tier, next_thr]
 
 
-# Comma-joined list of unlocked tier numbers (e.g. "T1, T2, T3").
+# Comma-joined list of unlocked venues with their tier numbers, in ladder
+# order (e.g. "Kitchen Table (T1), The Rec Room (T2), ..."). Venue names make
+# the career screen read as the same arc the session flow shows.
 func _unlocked_tiers_text() -> String:
 	var out: Array[String] = []
 	for t in CHGameState.TIER_SKILL_THRESHOLDS.size():
 		var tier := t + 1
 		if _state.is_tier_unlocked(tier):
-			out.append("T%d" % tier)
+			var c: CHTableConfig = CHTableConfig.for_tier(tier)
+			var nm: String = c.venue_name if c.venue_name != "" else c.name
+			out.append("%s (T%d)" % [nm, tier])
 	return ", ".join(out) if out.size() > 0 else "T1"
 
 
@@ -983,11 +1192,13 @@ func _heat_floors_text() -> String:
 func _help_sections() -> Array[String]:
 	return [
 		"What this is: a blackjack card-counting trainer. You play hands as a real casino counter would — track the running count, bet up when it is hot, lay low when it is cold.",
-		"Progression: seven table tiers, from the Tier 1 teaching table up to the Tier 7 continuous-shuffle contrast. Tiers unlock with your skill rating (0-100), which is updated at every session end from your process — decision quality and running-count accuracy — never from bankroll. Luck cannot demote you.",
+		"Progression: seven table tiers, from a friend's kitchen table up to the Tier 7 continuous-shuffle contrast. Each tier is a different place with a different opponent — Kitchen Table, Rec Room, Card Room, City Casino, High Stakes Floor, High Roller Pit, Pro Circuit. Tiers unlock with your skill rating (0-100), which is updated at every session end from your process — decision quality and running-count accuracy — never from bankroll. Luck cannot demote you.",
+		"Sal: your recurring rival sits at every table with his own bankroll. His cards and running P&L show in purple. He bets and plays on his own policy — beat him hand to hand, or watch him bust and take the seat.",
+		"Tier 1 is a pure counting drill: the hands deal and play themselves, and your only job is to track the running count from the cards you can see, then report it (e.g. +3 or -2). No betting, cover, or play decisions until you advance.",
 		"Modes: Target — reach the bankroll goal. Practice — play N shoes with no stakes. Survival — survive N shoes with real stakes on the table.",
 		"Heat: the pit watches for counting tells (betting up on a hot count, taking insurance, count-based deviations). Heat builds on each tell, decays while you lay low, and at maximum you are backed off and re-seated — at that tier's heat floor, which persists across sessions.",
 		"Cover: up to 3 bets per shoe can be declared as cover — a deliberate lay-low bet that is exempt from the discipline penalty.",
-		"Count checks: at each shoe cut you report the running count you tracked. Accuracy here is graded and feeds your skill rating.",
+		"Count checks: you report the running count you tracked — after every hand on the Tier 1 drill, at each shoe cut on higher tiers. Count every visible card (yours, the dealer's, and the other players' seats that join the table at higher tiers). Accuracy is graded and feeds your skill rating.",
 		"Controls: Space deal · 1-6 bet size · C cover · H hit · S stand · D double · R surrender · T take insurance · N decline insurance · S split · P play (no split) · Enter submit count · Tab stats · F1 help · Esc close panel.",
 	]
 
@@ -1004,13 +1215,6 @@ func _on_help_pressed() -> void:
 	if _help_panel.visible:
 		_hide_help()
 	else:
-		_show_help()
-
-
-# First launch (no save file on disk): show the intro so the player learns the
-# trainer's goals before the first hand. Re-openable any time via Help/F1.
-func _maybe_show_intro() -> void:
-	if not FileAccess.file_exists(CHGameState.DEFAULT_SAVE_PATH):
 		_show_help()
 
 
@@ -1049,6 +1253,17 @@ func _action_title(a: String) -> String:
 
 # --- Interaction ---
 
+# The between-hands "ground yourself" action: tops up composure and breaks the
+# mistake streak, spent from a per-shoe budget. Only meaningful while idle and
+# while uses remain (the loop no-ops otherwise); the button/keyboard gate mirrors
+# this so the player sees it only when it can do something.
+func _on_ground() -> void:
+	if not _loop.is_idle() or _loop.ground_uses_left() <= 0:
+		return
+	_loop.apply_action(CHGameLoop.ACT_GROUND)
+	_refresh_all()
+
+
 func _on_deal() -> void:
 	if not _loop.begin_hand():
 		# If the session is still active, begin_hand() failed for a transient
@@ -1059,12 +1274,25 @@ func _on_deal() -> void:
 		if _state.is_session_active():
 			_status_label.text = "Cannot start hand."
 		return
+	# Count-only teaching table (Tier 1): deal and play the hand automatically;
+	# the player's only interaction is the running-count report at each shoe cut.
+	if _loop.config.count_only:
+		_loop.auto_play_round()
 	_refresh_all()
 
 
 func _on_action(a: String) -> void:
+	# Capture the optimal call (and whether it was a count-driven deviation)
+	# before the phase leaves the current decision, so the feedback names the
+	# target. Engine auto-play (auto_play_round, tutorial stages 1-2) applies
+	# actions directly and never reaches this handler, so this is always a
+	# genuine player decision — no mode gate needed.
+	var optimal: String = _loop.optimal_action()
+	var is_dev: bool = _loop.is_deviation_play()
 	_loop.apply_action(a)
 	_refresh_all()
+	if optimal != "":
+		_status_label.text = _action_status_text(a, optimal, is_dev)
 
 
 func _on_bet_units(u: int) -> void:
@@ -1095,6 +1323,40 @@ func _bet_status_text(u: int, optimal: int, cover_granted: bool) -> String:
 	if u == optimal:
 		return "Bet: %du (optimal)" % u
 	return "Bet: %du — optimal was %du" % [u, optimal]
+
+
+# Post-decision play-call feedback, mirroring the bet feedback: names the
+# optimal call so a short/long (or off-basic) decision is reinforced. The
+# "(count deviation)" tag marks the hands where the live count changed the right
+# play from basic strategy — the central skill this trainer teaches.
+func _action_status_text(a: String, optimal: String, is_dev: bool) -> String:
+	var tag: String = " (count deviation)" if is_dev else ""
+	if a == optimal:
+		return "%s (optimal)%s" % [_pretty_action(a), tag]
+	return "%s — optimal was %s%s" % [_pretty_action(a), _pretty_action(optimal), tag]
+
+
+# Keyless, human-readable form of an action constant for status text (the
+# on-screen buttons use _action_title, which also carries the hotkey).
+func _pretty_action(a: String) -> String:
+	match a:
+		CHGameLoop.ACT_HIT:
+			return "Hit"
+		CHGameLoop.ACT_STAND:
+			return "Stand"
+		CHGameLoop.ACT_DOUBLE:
+			return "Double"
+		CHGameLoop.ACT_SURRENDER:
+			return "Surrender"
+		CHGameLoop.ACT_SPLIT:
+			return "Split"
+		CHGameLoop.ACT_PLAY:
+			return "No split"
+		CHGameLoop.ACT_INS_TAKE:
+			return "Take insurance"
+		CHGameLoop.ACT_INS_DECLINE:
+			return "Decline insurance"
+	return a
 
 
 func _on_cash_out() -> void:
@@ -1155,7 +1417,16 @@ func _unhandled_input(event: InputEvent) -> void:
 	var phase: String = _loop.phase()
 	match phase:
 		CHGameLoop.PHASE_IDLE, CHGameLoop.PHASE_SETTLED:
-			if k.keycode == KEY_SPACE or k.keycode == KEY_ENTER:
+			# Count-only teaching table (Tier 1): a shoe-cut count report, if
+			# pending, must be answered before the next hand is dealt — Enter
+			# submits it, Space waits. Mirrors the deal-button gate.
+			if _loop.config.count_only and _loop.is_count_check_due():
+				if k.keycode == KEY_ENTER:
+					_on_count_check_submit()
+				return
+			if k.keycode == KEY_G and _loop.ground_uses_left() > 0:
+				_on_ground()
+			elif k.keycode == KEY_SPACE or k.keycode == KEY_ENTER:
 				_on_deal()
 		CHGameLoop.PHASE_BET:
 			# Shoe-cut count check gates the bet: the bet buttons are disabled
@@ -1210,6 +1481,10 @@ func _refresh_all() -> void:
 func _refresh_hud() -> void:
 	_bankroll_label.text = "Bankroll: %d" % _state.current_bankroll
 	_discipline_label.text = "Discipline: %.0f" % _discipline.discipline
+	# Decision grading is a T2+ feature; on the Tier-1 counting drill no
+	# decisions are graded, so the readout stays hidden to keep the on-ramp
+	# HUD limited to what the player is actually doing (tracking the count).
+	_discipline_label.visible = _loop.config.grade_decisions
 	_tier_label.text = "Tier: %d" % _state.current_tier
 	_mode_label.text = "Mode: %s" % _state.session_mode
 	var stage: int = _loop.tutorial_stage()
@@ -1222,6 +1497,10 @@ func _refresh_hud() -> void:
 		_last_tutorial_stage = 0
 	_skill_label.text = _skill_label_text()
 	_cover_label.text = "Cover: %d left" % _loop.cover_plays_left()
+	# Cover is only usable once the table leaves the count-only teaching drill
+	# (its toggle is hidden there), so the readout follows the same gate rather
+	# than printing an orphaned "Cover: 3 left" on the counting drill.
+	_cover_label.visible = not _loop.config.count_only
 	_tilt_label.text = "Tilt: loss-chasing detected" if _loop.is_tilted() else ""
 	_tilt_label.visible = _loop.is_tilted()
 	# Count display. The count *system* shows (which system to count with); on a
@@ -1234,19 +1513,43 @@ func _refresh_hud() -> void:
 	else:
 		_count_system_label.text = "Count: %s" % count.count_system
 	_count_system_label.visible = true
-	if _loop.config.show_count_display:
+	if _loop.config.count_only:
+		# Count-only teaching table: the player tracks the running count
+		# themselves, so don't hand them the number. They report it at the
+		# per-hand prompt; this just reminds them what to keep an eye on.
+		_tc_label.text = "Running count: track it (report +N / -N)"
+		_tc_label.visible = true
+	elif _loop.config.show_count_display:
+		var rc: int = count.running_count
+		# Intrusive "misread": while fraying/insane the player sometimes reads the
+		# count wrong. Purely visual — the stored count is untouched, and the next
+		# refresh reverts it. Gated by misread_probability (0 while calm), so the
+		# teaching tiers never flicker.
+		var mp: float = _loop.get_mental_system().misread_probability()
+		if mp > 0.0 and randf() < mp:
+			rc += 1 if randf() < 0.5 else -1
 		_tc_label.text = "TC: %d (RC %+d, %.2f decks)" % [
-			_loop.current_tc(), count.running_count, count.decks_remaining]
+			_loop.current_tc(), rc, count.decks_remaining]
 		_tc_label.visible = true
 	else:
 		_tc_label.text = ""
 		_tc_label.visible = false
-	# Heat (suspicion) only shows when the table's heat system is active.
-	if _loop.config.heat_active:
-		var backoff: bool = _loop.needs_backoff()
+	# Heat (suspicion) only shows when the table's heat system is active AND can
+	# actually build: on the count-only teaching drill every tell is gated off
+	# (the player never bets or deviates), so heat stays at the floor forever and
+	# a live "Heat: 0%" meter would be noise — hide the readout there too.
+	# "flagged" covers both the pending backoff latch (between hands) and the
+	# lay-low hand itself: begin_hand clears the latch when it resets heat, so on
+	# the backoff hand the pending indicator alone would make "BACKED OFF" vanish
+	# — is_backoff_hand() keeps the pit's attention legible for that whole hand.
+	if _loop.config.heat_active and not _loop.config.count_only:
+		var pending: bool = _loop.needs_backoff()
+		var laying_low: bool = _loop.is_backoff_hand()
+		var flagged: bool = pending or laying_low
 		var hp: float = _loop.heat_percent()
-		_heat_label.text = "Heat: %d%%%s" % [int(roundf(hp * 100.0)), " — BACKED OFF" if backoff else ""]
-		var hc: Color = _heat_color(hp, backoff)
+		var suffix: String = " — BACKED OFF" if pending else (" — LAY LOW" if laying_low else "")
+		_heat_label.text = "Heat: %d%%%s" % [int(roundf(hp * 100.0)), suffix]
+		var hc: Color = _heat_color(hp, flagged)
 		if hc != Color(1, 1, 1):
 			_heat_label.add_theme_color_override("font_color", hc)
 		else:
@@ -1267,13 +1570,48 @@ func _refresh_hud() -> void:
 	# session. Recorded unconditionally (independent of grade_decisions), so the
 	# teaching table shows it even with scoring off. Hidden until a decision is
 	# made, so a fresh sit doesn't read "0 / 0".
-	if _discipline.session_decisions > 0:
+	# Count-only teaching table: the player made no play decisions (the engine
+	# auto-played), so the "Decisions: M/N" read-out would be a misleading
+	# self-grade. Hide it there; keep it on every real table.
+	if not _loop.config.count_only and _discipline.session_decisions > 0:
 		_decision_acc_label.text = "Decisions: %d/%d" % [
 			_discipline.session_optimal, _discipline.session_decisions]
 		_decision_acc_label.visible = true
 	else:
 		_decision_acc_label.text = ""
 		_decision_acc_label.visible = false
+	_refresh_run_label()
+	# Opponent (Sal) P&L readout — shown whenever the table seats a named rival.
+	var opp: CHOpponent = _loop.get_opponent()
+	if opp != null:
+		if _opponent_busted:
+			_opponent_label.text = "%s: busted" % opp.name
+			_opponent_label.add_theme_color_override("font_color", Color(0.9, 0.3, 0.3))
+		else:
+			_opponent_label.text = opp.summary()
+			_opponent_label.remove_theme_color_override("font_color")
+		_opponent_label.visible = true
+	else:
+		_opponent_label.text = ""
+		_opponent_label.visible = false
+
+
+# Live mistake-run tag (leading indicator of the composure spiral). The stability
+# band is hidden (no meter); this is the *early* cue that a spiral is building,
+# shown only while a run is in progress (resets to 0 on the next correct play).
+# It is driven from mental_changed (which fires *after* the streak mutates) as
+# well as _refresh_hud, so a bet-driven lapse updates the tag immediately rather
+# than waiting for the next unrelated refresh.
+func _refresh_run_label() -> void:
+	var run: int = _loop.mental_mistake_streak()
+	if run > 0:
+		_run_label.text = "Run: ×%d" % run
+		_run_label.add_theme_color_override("font_color", Color(0.95, 0.6, 0.3))
+		_run_label.visible = true
+	else:
+		_run_label.text = ""
+		_run_label.remove_theme_color_override("font_color")
+		_run_label.visible = false
 
 
 # Heat severity colour. Pure so it is testable without a live loop. White
@@ -1327,19 +1665,33 @@ func _refresh_cards() -> void:
 		if c is HBoxContainer and c != _dealer_row:
 			c.queue_free()
 
-	# Dealer: upcard always; hole only once revealed.
+	# Dealer: upcard always; hole + drawn cards only once the hole is revealed.
+	# Before reveal the dealer reads as two cards (upcard + face-down back);
+	# after reveal the whole hand renders, so the player can count the cards the
+	# dealer drew (they feed the running count even though the dealer's total
+	# is not shown until settle).
 	for c in _dealer_cards.get_children():
 		c.queue_free()
-	var up: CHCard = _loop.dealer_upcard()
-	if up != null:
-		_dealer_cards.add_child(_card_label(up))
-	var hole: CHCard = _loop.dealer_hole()
-	if hole != null:
-		_dealer_cards.add_child(_card_label(hole))
-	elif up != null:
-		# Hole not yet revealed (player still acting): show a face-down card
-		# back so the dealer's hand reads as two cards, not a lone upcard.
-		_dealer_cards.add_child(_card_back())
+	var dhand: CHHand = _loop.dealer_hand()
+	if dhand != null and not dhand.cards.is_empty():
+		var revealed: bool = _loop.dealer_hole() != null
+		for i in dhand.cards.size():
+			if revealed or i == 0:
+				_dealer_cards.add_child(_card_label(dhand.cards[i]))
+			else:
+				_dealer_cards.add_child(_card_back())
+		# Hole not yet revealed: the second card lives in _hole (not yet in
+		# _dealer), so render an explicit face-down back for it.
+		if not revealed:
+			_dealer_cards.add_child(_card_back())
+		# Once the dealer's hand is fully revealed (upcard + hole + any draws
+		# all face-up), show the hand total next to the cards — the same readout
+		# the player rows get — so the player can verify every card the dealer
+		# played is actually rendered (the total must equal the sum of the
+		# visible cards). Added to _dealer_cards so it is freed and rebuilt
+		# with the cards each refresh rather than accumulating on _dealer_row.
+		if revealed:
+			_dealer_cards.add_child(_hand_total_label(dhand))
 
 	# Player: the hands to show right now (see _hands_to_render). The hand the
 	# player is acting on is marked so a split/multi-spot table never reads as a
@@ -1361,6 +1713,48 @@ func _refresh_cards() -> void:
 			row.add_child(_card_label(c))
 		row.add_child(_hand_total_label(h))
 		_player_area.add_child(row)
+
+	# NPC players (higher-tier tables): render each NPC's hand as its own row so
+	# the player sees the full visible card stream (their own cards + every NPC
+	# seat + the dealer) and can practice counting all of it. Labels number the
+	# seats (the trainee is seat 1); NPCs are auto-played so none is active.
+	var npcs: Array[CHHand] = _loop.npc_hands()
+	for i in npcs.size():
+		var nrow := HBoxContainer.new()
+		nrow.add_theme_constant_override("separation", 6)
+		var nlbl := Label.new()
+		nlbl.text = "Player %d   " % (i + 2)
+		nlbl.add_theme_font_size_override("font_size", 16)
+		nlbl.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
+		nrow.add_child(nlbl)
+		var nh: CHHand = npcs[i]
+		for c in nh.cards:
+			nrow.add_child(_card_label(c))
+		nrow.add_child(_hand_total_label(nh))
+		_player_area.add_child(nrow)
+
+	# Named opponent (Sal): distinct from filler NPCs, shown with name + bet.
+	var opp: CHOpponent = _loop.get_opponent()
+	if opp != null:
+		var orow := HBoxContainer.new()
+		orow.add_theme_constant_override("separation", 6)
+		var oh: CHHand = _loop.opponent_hand()
+		var olbl := Label.new()
+		olbl.text = ("%s (%du)   " % [opp.name, _loop.opponent_bet()]) if oh != null else ("%s   " % opp.name)
+		olbl.add_theme_font_size_override("font_size", 16)
+		olbl.add_theme_color_override("font_color", Color(0.7, 0.5, 0.9))
+		orow.add_child(olbl)
+		if oh != null:
+			for c in oh.cards:
+				orow.add_child(_card_label(c))
+			orow.add_child(_hand_total_label(oh))
+		elif _opponent_busted:
+			var busted_lbl := Label.new()
+			busted_lbl.text = "BUSTED"
+			busted_lbl.add_theme_color_override("font_color", Color(0.9, 0.3, 0.3))
+			busted_lbl.add_theme_font_size_override("font_size", 14)
+			orow.add_child(busted_lbl)
+		_player_area.add_child(orow)
 
 
 # A small numeric readout of a player hand's total, placed after its cards.
@@ -1401,28 +1795,20 @@ func _active_hand_index(hands: Array[CHHand]) -> int:
 
 func _refresh_actions() -> void:
 	var in_bet: bool = _loop.phase() == CHGameLoop.PHASE_BET
-	# M16: a shoe-cut count check must be answered (or skipped) before the player
-	# may place a bet — the forcing function that makes the check engaging.
 	var count_gate: bool = _loop.is_count_check_due()
 	var bet_ready: bool = in_bet and not count_gate
-	# Tutorial (M116): stage 1 hides betting entirely (the engine auto-bets and
-	# auto-plays, the player just counts); stage 2 keeps betting manual and
-	# auto-plays the decisions; stage 3 is full manual play.
 	var stage: int = _loop.tutorial_stage()
-	# Stage 1 auto-bets (hide the bet controls); stages 0/2/3 bet manually.
-	var show_bets: bool = in_bet and stage != 1
-	# Stages 1-2 auto-play the strategy (hide the action controls); stages 0
-	# (normal) and 3 (full manual) show them.
-	var show_actions: bool = (not in_bet) and (stage == 0 or stage == 3)
+	var count_only: bool = _loop.config.count_only
+	# Count-only table: hide every decision control; only the deal button and
+	# the count-check input are relevant.
+	var show_bets: bool = in_bet and stage != 1 and not count_only
+	var show_actions: bool = (not in_bet) and (stage == 0 or stage == 3) and not count_only
 	for u in _bet_buttons.keys():
 		var b: Button = _bet_buttons[u]
 		b.visible = show_bets
 		b.disabled = not bet_ready
 	_cover_toggle.visible = show_bets
 	_cover_toggle.disabled = not bet_ready
-	# Hand/insurance/split buttons: hidden during the BET phase and in the
-	# guided tutorial stages. (Plain [] in a ternary is an untyped Array, which
-	# fails the typed-array assignment at runtime — so build it in a branch.)
 	var available: Array[String] = []
 	if not in_bet:
 		available = _loop.available_actions()
@@ -1431,11 +1817,28 @@ func _refresh_actions() -> void:
 		var on: bool = show_actions and available.has(a)
 		b.visible = on
 		b.disabled = not on
-	# Deal starts a hand in normal mode and stage 3 (full manual). In stages 1-2
-	# the guided "Next" control deals instead, so the player has one advance
-	# button throughout the on-ramp and the M118 "press Next" hint stays true.
+	# Deal button: visible when idle; disabled while a count check is pending
+	# (count-only mode) so the player must report the count before dealing.
 	_deal_button.visible = _loop.is_idle() and (stage == 0 or stage == 3)
-	_deal_button.disabled = not _state.is_session_active()
+	_deal_button.disabled = not _state.is_session_active() or (count_only and count_gate)
+	# Ground (composure recovery): shown between hands while a use remains and the
+	# session is active. Gated to normal/stage-3 play (not the guided tutorial
+	# flow) so it does not clutter the on-ramp. Available even on the count-only
+	# teaching table — it is the player's only way to recover composure there.
+	var g_on: bool = _loop.is_idle() and _loop.ground_uses_left() > 0 and _state.is_session_active() and (stage == 0 or stage == 3)
+	_ground_button.visible = g_on
+	_ground_button.disabled = not g_on
+	# Composure is hidden (no meter), so the only cues the player has that they are
+	# rattled are the intrusive thoughts + vignette. Make the recovery lever salient
+	# when it is actually valuable: while fraying/insane the button warms and is
+	# tagged "shaken" so it reads as a "use it now" prompt, not a corner button.
+	var mental_band: String = _loop.mental_state()
+	var shaken: bool = mental_band == CHMentalStateSystem.STATE_FRAYING or mental_band == CHMentalStateSystem.STATE_INSANE
+	_ground_button.text = "Ground (G) · %d left%s" % [_loop.ground_uses_left(), " — shaken" if shaken else ""]
+	if g_on and shaken:
+		_ground_button.add_theme_color_override("font_color", Color(0.95, 0.6, 0.3))
+	else:
+		_ground_button.remove_theme_color_override("font_color")
 	# The tutorial "Next" control, gated by the count check so a shoe-cut report
 	# is always answered before the hand advances. Stage 1 shows it whenever a
 	# step exists (idle = deal + auto-bet, BET = auto-bet, decision = auto-play);
@@ -1528,7 +1931,7 @@ func _maybe_announce_tutorial_stage(stage: int) -> void:
 	if stage <= _last_tutorial_stage:
 		return
 	if stage >= 2:
-		_show_tutorial_banner(_stage_transition_text(stage))
+		_show_session_banner(_stage_transition_text(stage))
 	_last_tutorial_stage = stage
 
 

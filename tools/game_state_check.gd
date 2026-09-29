@@ -30,6 +30,7 @@ func _init() -> void:
 	_check_target_reached()
 	_check_tier_gating()
 	_check_heat_floor_roundtrip()
+	_check_end_session_records_count_system()
 	_check_save_load_file_roundtrip()
 	_check_lifetime_counters()
 	_check_highest_unlocked_tier()
@@ -171,6 +172,31 @@ func _check_heat_floor_roundtrip() -> void:
 		_failures.append("roundtrip: skill rating mismatch")
 		return
 	print("PASS  save/load round-trip preserves heat floor, systems, skill rating")
+
+
+# M121: end_session must record the tier's counting system (before its save) so
+# the career screen lists it and the record persists in the same write as the
+# session stats — not lagged to a later save (the old post-signal unlock lost it
+# if the player quit right after first playing a new system).
+func _check_end_session_records_count_system() -> void:
+	var gs := CHGameState.new()
+	var sys: String = CHTableConfig.for_tier(2).count_system
+	if gs.is_system_unlocked(sys):
+		_failures.append("end-session-system: system '%s' pre-unlocked unexpectedly" % sys)
+		return
+	gs.start_session(2, CHGameState.MODE_PRACTICE, 0, 1)
+	gs.end_session("practice_complete", 100.0, false)
+	if not gs.is_system_unlocked(sys):
+		_failures.append("end-session-system: end_session did not record tier-2 system '%s' (unlocked=%s)" % [sys, str(gs.unlocked_systems)])
+		return
+	var gs2 := CHGameState.new()
+	if not gs2.deserialize(gs.serialize()):
+		_failures.append("end-session-system: deserialize failed")
+		return
+	if not gs2.is_system_unlocked(sys):
+		_failures.append("end-session-system: recorded system '%s' lost in round-trip" % sys)
+		return
+	print("PASS  end_session records + persists the tier's counting system")
 
 
 # 7. Real file round-trip (save/load_game) + tier auto-unlock via end_session

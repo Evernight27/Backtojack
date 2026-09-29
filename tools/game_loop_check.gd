@@ -59,6 +59,7 @@ func _init() -> void:
 	_check_insurance_loss_normal_path()
 	_check_h17_dealer_soft17()
 	_check_natural_win_payout()
+	_check_dealer_natural_hand_completeness()
 	_check_split_ace_settlement()
 	_check_push_settlement()
 	_check_late_surrender_timing()
@@ -68,6 +69,8 @@ func _init() -> void:
 	_check_place_bet_clamping()
 	_check_heat_tell_triggers()
 	_check_deviation_tell()
+	_check_count_only_heat_suppressed()
+	_check_npc_players()
 	_cleanup_save()
 
 	if _failures.is_empty():
@@ -591,6 +594,63 @@ func _drive_natural_win(payout: float, seed: int) -> float:
 		_failures.append("natural win: hand did not settle, phase=%s" % loop.phase())
 		return -999.0
 	return loop.last_net()
+
+
+# M106: dealer-natural hand completeness. On the natural-settle path
+# (_after_insurance -> _settle_natural) the hole is revealed but historically
+# never appended to the live _dealer hand — the append only happened in
+# _play_dealer_and_settle, which a natural skips. Result: the UI rendered the
+# dealer as a lone "10" (no face-down back, since the hole reads as revealed)
+# and _settle_opponent compared the rival against the upcard alone instead of
+# the two-card 21. This pins the post-settle dealer hand: a dealer natural must
+# present as the full two-card hand totaling 21.
+func _check_dealer_natural_hand_completeness() -> void:
+	var c := CHTableConfig.new()
+	c.deck_count = 1
+	c.dealer_hits_soft_17 = false
+	c.blackjack_payout = 1.5
+	c.allows_split = false
+	c.allows_double = false
+	c.allows_surrender = false
+	c.allows_insurance = false
+	c.grade_decisions = false
+	c.grade_bet_ramp = false
+	var state := CHGameState.new()
+	state.start_session(1, CHGameState.MODE_TARGET, 999999)
+	var loop := CHGameLoop.new(c, state, CHDisciplineSystem.new(), SEED)
+	var shoe := loop.get_shoe()
+	var total := shoe.deck.size()
+	shoe.deck.clear()
+	# [0] up 10 of diamonds, [1] hole Ace -> dealer natural (21).
+	# [2] p1 King of diamonds, [3] p2 8 of diamonds -> 19, not a natural.
+	shoe.deck.append(CHCard.new("D", 10))
+	shoe.deck.append(CHCard.new("S", 14))
+	shoe.deck.append(CHCard.new("D", 13))
+	shoe.deck.append(CHCard.new("D", 8))
+	for i in range(total - 4):
+		shoe.deck.append(CHCard.new("C", 2))
+	shoe.deal_index = 0
+	if not loop.begin_hand():
+		_failures.append("dealer-natural completeness: begin_hand failed")
+		return
+	loop.place_bet(1, false)
+	# A dealer natural settles the round immediately (no insurance on a 10 upcard).
+	if not loop.is_idle():
+		_failures.append("dealer-natural completeness: hand did not settle, phase=%s" % loop.phase())
+		return
+	if absf(loop.last_net() - (-1.0)) >= 1e-6:
+		_failures.append("dealer-natural completeness: expected the non-natural spot to lose -1.0, got %.2f" % loop.last_net())
+	var dhand: CHHand = loop.dealer_hand()
+	if dhand.cards.size() != 2:
+		_failures.append("dealer-natural completeness: dealer hand should hold the two-card natural, got %d card(s)" % dhand.cards.size())
+		return
+	if not dhand.is_blackjack():
+		_failures.append("dealer-natural completeness: settled dealer hand should be a blackjack (10 + Ace)")
+		return
+	if dhand.total() != 21:
+		_failures.append("dealer-natural completeness: dealer natural total should be 21, got %d" % dhand.total())
+		return
+	print("PASS  dealer-natural hand completeness: natural settles as a full two-card 21")
 
 
 # M35: split-ace settlement. `multi_hand_check` asserts split aces produce two
@@ -1249,6 +1309,150 @@ func _drive_dev_tell(up_rank: int, hole_rank: int) -> float:
 		_failures.append("dev-tell: not idle after stand, phase=%s" % loop.phase())
 		return -999.0
 	return loop.get_heat_system().heat
+
+
+# M121: count-only teaching tables suppress the player-agency heat tells. The
+# hand is auto-played by the engine, so betting/insurance/deviation would build
+# heat the player never chose — the drill is pressure-free. The only difference
+# between the two loops below is count_only (same seed/shoe), so the heat-delta
+# difference isolates the bet tell: present in the control, suppressed on the
+# count-only table. No hand settles (the loop is left in HAND), so no decay
+# muddies the measurement.
+func _check_count_only_heat_suppressed() -> void:
+	var co: float = _count_only_heat_delta(true)
+	var ctrl: float = _count_only_heat_delta(false)
+	if absf(co) < 1e-6:
+		print("PASS  count-only heat: hot auto-bet adds no heat (no player agency)")
+	else:
+		_failures.append("count-only heat: expected 0 heat from auto-bet, got %.2f" % co)
+	if absf(ctrl - CHHeatSystem.BET_TELL_GAIN) < 1e-6:
+		print("PASS  count-only heat control: non-count-only hot bet adds %.1f (tell live)" % ctrl)
+	else:
+		_failures.append("count-only heat control: expected +%.1f, got %.2f" % [CHHeatSystem.BET_TELL_GAIN, ctrl])
+
+
+# Fresh heat-active 1-deck loop, hot count (TC 5), upcard 5 (no insurance) so the
+# hand rests in HAND after the bet (no settle, no decay). Returns the heat delta
+# across a 4-unit bet. `count_only` toggles the teaching-table flag.
+func _count_only_heat_delta(count_only: bool) -> float:
+	var c := CHTableConfig.new()
+	c.deck_count = 1
+	c.heat_active = true
+	c.count_only = count_only
+	c.allows_insurance = false
+	c.grade_decisions = false
+	c.grade_bet_ramp = false
+	var state := CHGameState.new()
+	state.start_session(1, CHGameState.MODE_TARGET, 999999)
+	var loop := CHGameLoop.new(c, state, CHDisciplineSystem.new(), SEED)
+	loop.get_count().running_count = 5
+	var shoe := loop.get_shoe()
+	var total := shoe.deck.size()
+	shoe.deck.clear()
+	shoe.deck.append(CHCard.new("H", 5))   # upcard (not an Ace: no insurance)
+	shoe.deck.append(CHCard.new("S", 2))   # hole (dealer 7, stands)
+	shoe.deck.append(CHCard.new("S", 8))   # p1
+	shoe.deck.append(CHCard.new("H", 5))   # p2 -> hard 13
+	for i in range(total - 4):
+		shoe.deck.append(CHCard.new("C", 2))
+	shoe.deal_index = 0
+	if not loop.begin_hand():
+		_failures.append("count-only heat: begin_hand failed")
+		return -999.0
+	var before: float = loop.get_heat_system().heat
+	loop.place_bet(4, false)
+	return loop.get_heat_system().heat - before
+
+
+# --- NPC players (config.npc_players) ---
+# A higher-tier table fills the seats with auto-played NPC hands. Verify: (a) the
+# NPC is dealt and auto-played to a terminal state (17+ or bust), (b) its cards are
+# revealed (counted) and shoe conservation still holds, (c) the trainee's P&L is
+# unaffected (the NPC has no stake), and (d) the run stays deterministic.
+func _check_npc_players() -> void:
+	var nets: Array[float] = []
+	for run in 2:
+		var c := CHTableConfig.new()
+		c.deck_count = 1
+		c.npc_players = 1
+		c.allows_insurance = false  # isolate the NPC path (no side-bet branch)
+		c.grade_decisions = false
+		c.grade_bet_ramp = false
+		var state := CHGameState.new()
+		state.start_session(1, CHGameState.MODE_TARGET, 999999)
+		var loop := CHGameLoop.new(c, state, CHDisciplineSystem.new(), SEED)
+		var hands := 0
+		var conservation_bad := 0
+		var saw_npc := false
+		while hands < 50 and state.is_session_active():
+			if not loop.begin_hand():
+				break
+			hands += 1
+			# NPC is dealt + auto-played once the round passes the BET phase
+			# (place_bet -> _deal_opening -> _after_insurance -> _play_npcs). Probe
+			# it mid-round, before the hand settles and clears _npc_hands.
+			while not loop.is_idle():
+				if not saw_npc and loop.npc_hands().size() == 1:
+					saw_npc = true
+					var nh: CHHand = loop.npc_hands()[0]
+					if nh.cards.size() < 2:
+						_failures.append("npc: hand has %d cards (<2)" % nh.cards.size())
+					if nh.cards.size() > 12:
+						_failures.append("npc: hand grew past guard (%d cards)" % nh.cards.size())
+					# Terminal per basic strategy: the engine no longer wants to hit.
+					var up: CHCard = loop.dealer_upcard()
+					var p: String = loop.engine.best_play_no_split(
+						nh, CHHand.dealer_upcard_key(up.rank), loop.config, 0)
+					if not nh.is_bust() and p == "hit":
+						_failures.append("npc: engine still wants to hit NPC hand (total %d)" % nh.total())
+					# Bust-stops-on-first-bust: a bust must be caused by the LAST
+					# card (prefix <= 21). Catches an over-drawn bust (e.g. hard 16
+					# hit into 22, then kept drawing because _hard_play(22) falls
+					# through to the default "hit").
+					if nh.is_bust():
+						var pre := 0
+						var aces_pre := 0
+						for k in nh.cards.size() - 1:
+							var cc: CHCard = nh.cards[k]
+							if cc.is_ace():
+								aces_pre += 1
+								pre += 11
+							elif cc.rank >= 10:
+								pre += 10
+							else:
+								pre += cc.rank
+						while pre > 21 and aces_pre > 0:
+							pre -= 10
+							aces_pre -= 1
+						if pre > 21:
+							_failures.append("npc: over-drew a bust hand (%d cards, prefix %d > 21)" % [nh.cards.size(), pre])
+				loop.apply_action(loop.optimal_action())
+			# P&L isolation: the trainee's wagered is its own bet only, never the NPC's.
+			var wagered: float = loop.last_wagered()
+			if wagered < 1.0:
+				_failures.append("npc: trainee wagered %.1f < 1 (NPC leaked into P&L)" % wagered)
+			nets.append(loop.last_net())
+			# Conservation: every card dealt (incl. NPC) is revealed exactly once.
+			var dealt: int = loop.get_shoe().cards_dealt()
+			var seen := 0
+			for j in dealt:
+				if loop.get_shoe().deck[j].seen:
+					seen += 1
+			if seen != dealt:
+				conservation_bad += 1
+		if not saw_npc:
+			_failures.append("npc: never observed an NPC hand across the soak")
+		if conservation_bad > 0:
+			_failures.append("npc: card conservation violated in %d hand(s)" % conservation_bad)
+		if hands < 1:
+			_failures.append("npc: no hands driven")
+	# Determinism: the NPC consumes cards, but the trainee sequence must still be
+	# identical across two runs with the same seed.
+	if nets.size() >= 2:
+		var half: int = nets.size() / 2
+		for i in half:
+			if absf(nets[i] - nets[half + i]) > 1e-6:
+				_failures.append("npc: determinism broken across runs")
 
 
 # A target-mode check can end the session as "bust" (bankroll -> 0), which

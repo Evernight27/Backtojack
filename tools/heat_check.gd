@@ -143,3 +143,10 @@ func _check_loop_backoff_resets() -> void:
 	_expect(bool(flag.emitted), "heat_backoff emitted when backoff is resolved")
 	_expect(loop.heat() == 0.0, "heat reset to floor (0) after backoff, got %s" % loop.heat())
 	_expect(not loop.needs_backoff(), "backoff cleared after resolution")
+	# The resolved hand is a "backoff hand": it flags lay-low, and the optimal
+	# bet is forced to the minimum (1) so laying low is the count-correct call.
+	_expect(loop.is_backoff_hand(), "begin_hand that resolved a backoff flags the lay-low hand")
+	_expect(loop.optimal_bet_units() == 1, "backoff hand: optimal bet forced to min, got %d" % loop.optimal_bet_units())
+	_finish_hand(loop)
+	# The flag is scoped to that one hand: once it settles, the next hand is normal.
+	_expect(not loop.is_backoff_hand(), "backoff hand flag clears after the hand settles")

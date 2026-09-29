@@ -60,20 +60,25 @@ func is_red() -> bool:
 func count_value(system: String = "hi_lo") -> int:
 	match system:
 		"ko":
-			if rank >= 2 and rank <= 6:
+			# Knock-Out (canonical): 2-7 = +1, 8-9 = 0, A = 0, 10-K = -1.
+			# Unbalanced (full-deck net +8).
+			if rank >= 2 and rank <= 7:
 				return 1
-			if rank >= 7 and rank <= 9:
+			if rank >= 8 and rank <= 9:
 				return 0
 			if rank == 14:
 				return 0
 			return -1
 		"hi_opt_ii":
-			# Hi-Opt II: +1 on 2-4, 0 on 5-7 and the Ace, -1 on 8-10.
+			# Hi-Opt II (canonical): A = -1, 2-4 = +1, 5-9 = 0, J/Q = 0, 10/K = -1.
+			# Balanced system (full-deck net 0).
+			if rank == 14:
+				return -1
 			if rank >= 2 and rank <= 4:
 				return 1
-			if rank >= 5 and rank <= 7:
+			if rank >= 5 and rank <= 9:
 				return 0
-			if rank == 14:
+			if rank == 11 or rank == 12:
 				return 0
 			return -1
 		_:

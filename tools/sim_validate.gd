@@ -5,7 +5,7 @@ extends SceneTree
 #      running count of 0 (validates CHCountEngine against CHCard.count_value).
 #   B. No-split baseline: player plays best_play_no_split (a pair is played as
 #      a normal hand by its hard/soft total). Single deck, S17, 3:2, seed
-#      20260906, 500k hands. Documented baseline: 0.954% (post-M60).
+#      20260906, 500k hands. Documented baseline: 1.144% (post-M129).
 #   C. Split-enabled: full split resolution via CHSplitResolver (split aces
 #      one-card, resplit capped at max_split_hands, DAS). Edge should drop
 #      below the no-split baseline.
@@ -26,7 +26,7 @@ const TOTAL_HANDS := 500000
 # penetration-invariant, so cutting the shoe early does not bias the result.
 const SHOE_RESERVE := 20
 # No-split baseline band for the reconstructed single-deck S17 3:2 policy
-# (pairs played as normal hands). Reproduces the documented 0.954% (post-M60).
+# (pairs played as normal hands). Reproduces the documented 1.144% (post-M129).
 const EDGE_BAND_MIN: float = 0.40
 const EDGE_BAND_MAX: float = 1.40
 # Split-enabled band: full split resolution (CHSplitResolver) should push the
@@ -50,7 +50,7 @@ func _init() -> void:
 	_check_count_invariants()
 
 	# Phase A: no-split baseline. Pairs are played as normal hands (the M0/M1
-	# reconstruction). Reproduces the documented 0.954% (post-M60) for this ruleset/seed.
+	# reconstruction). Reproduces the documented 1.144% (post-M129) for this ruleset/seed.
 	var no_split_edge: float = _run_simulation(_base_config(), TOTAL_HANDS)
 	var no_split_ok := no_split_edge >= EDGE_BAND_MIN and no_split_edge <= EDGE_BAND_MAX
 	if not no_split_ok:

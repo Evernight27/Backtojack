@@ -3,7 +3,8 @@ extends SceneTree
 #
 # The only counting sim (sim_validate) is hard-wired to Hi-Lo on a single-deck
 # S17 table. But the progression tiers train different systems: Tier 2 uses KO
-# (aces counted 0), Tier 5 uses Hi-Opt II (5-7 counted 0, unbalanced). Nothing
+# (aces counted 0, unbalanced +8/deck), Tier 5 uses Hi-Opt II (balanced, net 0,
+# 5-9 and J/Q counted 0). Nothing
 # verified that a KO or Hi-Opt II counter, using this engine's bet ramp + I18
 # deviations, actually beats a flat-bet basic-strategy player on its own table.
 #

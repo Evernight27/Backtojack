@@ -63,6 +63,7 @@ func _expect(cond: bool, msg: String) -> void:
 func _make_config(spots: int) -> CHTableConfig:
 	var c := CHTableConfig.for_tier(1)
 	c.player_hand_count = spots
+	c.opponent = null  # isolate multi-hand mechanics from the social opponent
 	return c
 
 

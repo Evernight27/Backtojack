@@ -56,6 +56,9 @@ func _init() -> void:
 	_check_insurance_shows_player_hand(main)
 	_check_tilt_indicator_rendering(main)
 	_check_heat_backoff_rendering(main)
+	_check_heat_lay_low_rendering(main)
+	_check_mistake_run_rendering(main)
+	_check_debrief_full_line_rendering(main)
 	_check_skill_label(main)
 	_check_presplit_multi_spot_rendering(main)
 	_check_help_panel(main)
@@ -63,14 +66,25 @@ func _init() -> void:
 	_check_pnl_rounding(main)
 	_check_card_back(main)
 	_check_bet_feedback_text(main)
+	_check_action_feedback_text(main)
 	_check_active_hand_index(main)
 	_check_hand_total_label(main)
 	_check_heat_color(main)
 	_check_stats_panel(main)
 	_check_tutorial_mode(main)
+	_check_count_only_teaching_table(main)
+	_check_t1_teaching_hud_clean(main)
+	_check_npc_player_rows(main)
+	_check_venue_banner(main)
+	_check_opponent_row(main)
+	_check_t1_no_opponent(main)
+	_check_dealer_drawn_cards_rendered(main)
 
-	# Switch to a 1-shoe practice session and drive it to completion.
+	# Switch to a 1-shoe practice session and drive it to completion. T1 is the
+	# count-only teaching table, but this drive exercises the *normal* bet/play +
+	# Decisions debrief path, so run it with count_only disabled.
 	main._start_session(1, CHGameState.MODE_PRACTICE, 0, 1)
+	main._loop.config.count_only = false
 	_expect(main._state.session_mode == CHGameState.MODE_PRACTICE, "mode is practice")
 	_expect(main._shoes_spin.visible, "shoe count visible in practice mode")
 
@@ -204,8 +218,10 @@ func _check_count_check_empty_submit(main: Control) -> void:
 	main._count_check_input.text = "7"
 	main._on_count_check_submit()
 	_expect(not main._loop.is_count_check_due(), "M79: check cleared after a valid report")
-	_expect(main._status_label.text.contains("actual was"),
-		"M79: valid report still surfaces feedback, got '%s'" % main._status_label.text)
+	# A correct report (reported == actual) now confirms success rather than
+	# reading as an error; only a nonzero abs_error shows the "off by N" form.
+	_expect(main._status_label.text.contains("correct (you said 7)"),
+		"M79: correct report surfaces 'correct' feedback, got '%s'" % main._status_label.text)
 
 
 # M64: the mode selector restarts a session, but only target mode carries a
@@ -260,6 +276,10 @@ func _check_tier_switching(main: Control) -> void:
 # above. Uses a T1 session because T1 is the tier where allows_insurance=true.
 func _check_insurance_prompt_rendering(main: Control) -> void:
 	main._start_session(1, CHGameState.MODE_TARGET, 150, 3)
+	# T1 is now the count-only teaching table (bet/cover/play controls hidden).
+	# This check is a pure insurance-prompt *rendering* contract, so test it with
+	# the count-only mode off, the same way _phase is faked below.
+	main._loop.config.count_only = false
 	main._loop._phase = CHGameLoop.PHASE_INSURANCE
 	main._refresh_actions()
 	_expect(main._action_buttons[CHGameLoop.ACT_INS_TAKE].visible, "insurance-take button visible in insurance phase")
@@ -329,9 +349,10 @@ func _check_tilt_indicator_rendering(main: Control) -> void:
 # M65: when the heat system has latched a backoff, the HUD heat label must
 # surface the "BACKED OFF" state. Latches the backoff directly on the loop's
 # heat system and checks the rendering, independent of how the backoff was
-# earned.
+# earned. Uses tier 2 (not the tier-1 counting drill) because the heat readout
+# is hidden on the count-only teaching table, where heat can never build.
 func _check_heat_backoff_rendering(main: Control) -> void:
-	main._start_session(1, CHGameState.MODE_TARGET, 150, 3)
+	main._start_session(2, CHGameState.MODE_TARGET, 150, 3)
 	var heat: CHHeatSystem = main._loop.get_heat_system()
 	heat.reset(0.0)
 	heat.pending_backoff = false
@@ -341,6 +362,106 @@ func _check_heat_backoff_rendering(main: Control) -> void:
 	main._refresh_hud()
 	_expect(main._heat_label.visible, "heat label visible while backoff latched")
 	_expect(main._heat_label.text.contains("BACKED OFF"), "heat label surfaces BACKED OFF, got '%s'" % main._heat_label.text)
+
+
+# M126: the lay-low hand itself (after begin_hand resolves the latch) must stay
+# legible — the pending latch clears on reset, so only is_backoff_hand() tells us
+# the current hand is the "lay low" one. Drives the internal flag directly, as
+# the BACKED OFF check drives pending_backoff, and checks the HUD rendering.
+# Tier 2 (not the tier-1 counting drill) because the heat readout is hidden on
+# the count-only teaching table, where heat can never build.
+func _check_heat_lay_low_rendering(main: Control) -> void:
+	main._start_session(2, CHGameState.MODE_TARGET, 150, 3)
+	var heat: CHHeatSystem = main._loop.get_heat_system()
+	heat.reset(0.0)
+	heat.pending_backoff = false
+	main._loop._backoff_hand = true
+	main._refresh_hud()
+	_expect(main._heat_label.visible, "heat label visible on lay-low hand")
+	_expect(main._heat_label.text.contains("LAY LOW"), "heat label surfaces LAY LOW, got '%s'" % main._heat_label.text)
+	_expect(not main._heat_label.text.contains("BACKED OFF"),
+		"lay-low hand is not labeled BACKED OFF, got '%s'" % main._heat_label.text)
+	# When both the pending latch and the lay-low flag are set, BACKED OFF wins.
+	main._loop._backoff_hand = false
+	heat.pending_backoff = true
+	main._refresh_hud()
+	_expect(main._heat_label.text.contains("BACKED OFF"),
+		"pending latch still surfaces BACKED OFF, got '%s'" % main._heat_label.text)
+
+
+# M127: the live mistake-run tag must surface "Run: ×N" while a run is in
+# progress and hide it once the run clears. The stability band is intentionally
+# hidden (no meter); the run is the *early* play-quality cue that a composure
+# spiral is building. Drives the streak directly, as the lay-low check drives
+# _backoff_hand, and checks the HUD rendering contract.
+func _check_mistake_run_rendering(main: Control) -> void:
+	main._start_session(2, CHGameState.MODE_TARGET, 150, 3)
+	var m: CHMentalStateSystem = main._loop.get_mental_system()
+	m.mistake_streak = 0
+	main._refresh_hud()
+	_expect(not main._run_label.visible, "run tag hidden when no run is in progress")
+	_expect(main._run_label.text == "", "run tag empty when clean, got '%s'" % main._run_label.text)
+	m.mistake_streak = 3
+	main._refresh_hud()
+	_expect(main._run_label.visible, "run tag visible while a mistake run is in progress")
+	_expect(main._run_label.text.contains("×3"), "run tag surfaces the live run, got '%s'" % main._run_label.text)
+	m.mistake_streak = 0
+	main._refresh_hud()
+	_expect(not main._run_label.visible, "run tag hidden again once the run clears")
+	# Signal-driven update (M128): a bet-driven lapse mutates the streak *before*
+	# the decision_graded -> _refresh_hud ordering completes the render, so the
+	# mental_changed signal (emitted after the mutation) must refresh the tag on
+	# its own — no full HUD pass required.
+	m.mistake_streak = 0
+	main._refresh_hud()
+	m.mistake_streak = 2
+	main._loop.mental_changed.emit(40.0)
+	_expect(main._run_label.visible, "run tag refreshed via mental_changed signal alone")
+	_expect(main._run_label.text.contains("×2"), "run tag shows ×2 after signal refresh, got '%s'" % main._run_label.text)
+
+
+# M129: the debrief label pool must resize to the actual line count. A tier-2
+# session that makes play decisions AND reports a count check generates 10 lines
+# (base 6 + Decisions + Composure + Counting + Unlocked). The pool was fixed at
+# 9, silently clipping the trailing "Unlocked / Highest unlocked tier" line.
+# Drives a 2-shoe tier-2 practice session, reporting counts at shoe cuts, then
+# asserts the full line set renders with no empty labels.
+func _check_debrief_full_line_rendering(main: Control) -> void:
+	main._start_session(2, CHGameState.MODE_PRACTICE, 0, 2)
+	var hands := 0
+	var guard_total := 0
+	while main._state.is_session_active() and hands < 500 and guard_total < 4000:
+		if not main._loop.begin_hand():
+			break
+		hands += 1
+		if main._loop.phase() == CHGameLoop.PHASE_BET:
+			main._loop.place_bet(main._loop.optimal_bet_units())
+		var guard := 0
+		while not main._loop.is_idle() and guard < 60:
+			main._loop.apply_action(main._loop.optimal_action())
+			guard += 1
+			guard_total += 1
+		if main._loop.is_count_check_due():
+			main._loop.report_count(main._loop.last_shoe_rc())
+	_expect(not main._state.is_session_active(), "debrief-clip: session completed")
+	_expect(main._debrief_panel.visible, "debrief-clip: debrief panel visible")
+	# Preconditions: all three conditional lines present (10 total).
+	_expect(main._discipline.session_decisions > 0,
+		"debrief-clip: decisions recorded, got %d" % main._discipline.session_decisions)
+	_expect(main._loop.get_count_accuracy().checks > 0,
+		"debrief-clip: count check reported, got %d" % main._loop.get_count_accuracy().checks)
+	var debrief_text := ""
+	var empty_lines := 0
+	for l in main._debrief_lines:
+		debrief_text += l.text + "\n"
+		if l.text.strip_edges().is_empty():
+			empty_lines += 1
+	# The trailing progression line (previously clipped at 9 labels) must render.
+	_expect(debrief_text.contains("Unlocked") or debrief_text.contains("Highest unlocked tier"),
+		"debrief-clip: progression line renders, got:\n" + debrief_text)
+	_expect(empty_lines == 0, "debrief-clip: no empty debrief lines, got %d" % empty_lines)
+	_expect(main._debrief_lines.size() == 10,
+		"debrief-clip: pool sized to 10, got %d" % main._debrief_lines.size())
 
 
 # M22: the Cash Out button ends the active session and surfaces the debrief.
@@ -370,6 +491,10 @@ func _check_keyboard_shortcuts(main: Control) -> void:
 	# A first-run intro panel may be up; it gates gameplay input by design.
 	main._hide_help()
 	main._start_session(1, CHGameState.MODE_TARGET, 150, 3)
+	# T1 is the count-only teaching table (Space deals AND auto-plays, never
+	# resting in BET). This check exercises the *normal* keyboard model
+	# (Space -> BET, digit -> bet), so test it with count-only off.
+	main._loop.config.count_only = false
 	_expect(main._loop.phase() == CHGameLoop.PHASE_IDLE, "kb: idle before deal")
 	_key(main, KEY_SPACE)
 	_expect(main._loop.phase() == CHGameLoop.PHASE_BET, "kb: Space deals -> BET, got %s" % main._loop.phase())
@@ -383,6 +508,7 @@ func _check_keyboard_shortcuts(main: Control) -> void:
 	# rests between hands — the deal button is visible there and is labeled
 	# "(Space)", but the key binding only covered the initial IDLE phase.
 	main._start_session(1, CHGameState.MODE_TARGET, 150, 3)
+	main._loop.config.count_only = false
 	main._loop._phase = CHGameLoop.PHASE_SETTLED
 	_key(main, KEY_SPACE)
 	_expect(main._loop.phase() == CHGameLoop.PHASE_BET,
@@ -501,24 +627,25 @@ func _check_presplit_multi_spot_rendering(main: Control) -> void:
 		"presplit-render-single: only the current root renders, got %d" % single_rendered.size())
 
 
-# M84: the onboarding help panel must exist, toggle via F1/Esc/button, show on
-# first launch (no save file), and stay hidden when a save exists.
+# M84/M130: the help panel must exist and stay hidden by default (no auto
+# intro on first launch — M130); it only appears when the player opens it via
+# F1, Esc-close, or the Help button.
 func _check_help_panel(main: Control) -> void:
 	_expect(main._help_panel != null, "help: panel exists")
 	_expect(main._help_button != null, "help: button exists")
-	# First run: no save file -> _maybe_show_intro surfaces the panel.
+	# First run: no save file, and the panel must not pop up on its own (M130).
 	var p := ProjectSettings.globalize_path(CHGameState.DEFAULT_SAVE_PATH)
 	if FileAccess.file_exists(p):
 		DirAccess.remove_absolute(p)
 	main._hide_help()
-	main._maybe_show_intro()
-	_expect(main._help_panel.visible, "help: first run shows the intro")
-	# F1 toggles it closed, then reopens it.
+	_expect(not main._help_panel.visible, "help: no auto intro on first run")
+	# F1 opens it, then F1 closes it.
+	_key(main, KEY_F1)
+	_expect(main._help_panel.visible, "help: F1 opens the panel")
 	_key(main, KEY_F1)
 	_expect(not main._help_panel.visible, "help: F1 closes the panel")
-	_key(main, KEY_F1)
-	_expect(main._help_panel.visible, "help: F1 reopens the panel")
 	# Esc closes it.
+	_key(main, KEY_F1)
 	_key(main, KEY_ESCAPE)
 	_expect(not main._help_panel.visible, "help: Esc closes the panel")
 	# The Help button toggles it.
@@ -526,11 +653,6 @@ func _check_help_panel(main: Control) -> void:
 	_expect(main._help_panel.visible, "help: button opens the panel")
 	main._on_help_pressed()
 	_expect(not main._help_panel.visible, "help: button closes the panel")
-	# A save on disk means no intro on the next start.
-	if not CHGameState.new().save(CHGameState.DEFAULT_SAVE_PATH):
-		_failures.append("help: test setup save write failed")
-	main._maybe_show_intro()
-	_expect(not main._help_panel.visible, "help: no intro when a save exists")
 
 
 # Driving the practice session to completion ends it (end_session -> save()),
@@ -587,6 +709,38 @@ func _check_bet_feedback_text(main: Control) -> void:
 	_expect(main._bet_status_text(2, 6, false) == "Bet: 2u — optimal was 6u", "bet-feedback: short bet")
 	_expect(main._bet_status_text(6, 1, false) == "Bet: 6u — optimal was 1u", "bet-feedback: long bet")
 	_expect(main._bet_status_text(1, 4, true) == "Bet: 1u (cover)", "bet-feedback: cover overrides optimal")
+
+
+# M121: per-action decision feedback mirrors bet feedback and tags count deviations.
+func _check_action_feedback_text(main: Control) -> void:
+	# _pretty_action
+	_expect(main._pretty_action("hit") == "Hit", "pretty: hit")
+	_expect(main._pretty_action("stand") == "Stand", "pretty: stand")
+	_expect(main._pretty_action("double") == "Double", "pretty: double")
+	_expect(main._pretty_action("surrender") == "Surrender", "pretty: surrender")
+	_expect(main._pretty_action("split") == "Split", "pretty: split")
+	_expect(main._pretty_action("play") == "No split", "pretty: play")
+	_expect(main._pretty_action("take") == "Take insurance", "pretty: take")
+	_expect(main._pretty_action("decline") == "Decline insurance", "pretty: decline")
+	_expect(main._pretty_action("unknown_xyz") == "unknown_xyz", "pretty: fallback passthrough")
+
+	# _action_status_text: optimal match
+	_expect(main._action_status_text("stand", "stand", false) == "Stand (optimal)",
+		"action-feedback: optimal stand")
+	_expect(main._action_status_text("hit", "hit", false) == "Hit (optimal)",
+		"action-feedback: optimal hit")
+
+	# _action_status_text: non-optimal
+	_expect(main._action_status_text("hit", "stand", false) == "Hit — optimal was Stand",
+		"action-feedback: hit vs stand")
+	_expect(main._action_status_text("stand", "double", false) == "Stand — optimal was Double",
+		"action-feedback: stand vs double")
+
+	# _action_status_text: deviation tag
+	_expect(main._action_status_text("hit", "hit", true) == "Hit (optimal) (count deviation)",
+		"action-feedback: deviation tag on optimal")
+	_expect(main._action_status_text("stand", "hit", true) == "Stand — optimal was Hit (count deviation)",
+		"action-feedback: deviation tag on non-optimal")
 
 
 # M88: the dealer's hidden hole card must render as a face-down card back (not a
@@ -714,9 +868,9 @@ func _check_stats_panel(main: Control) -> void:
 	var lines: Array[String] = main._stats_lines()
 	_expect(lines.size() == 5, "stats: 5 lines, got %d" % lines.size())
 	_expect(lines[0].begins_with("Skill rating:  72.5"), "stats: rating line, got '%s'" % lines[0])
-	_expect(lines[0].contains("T5 unlocks at 80"), "stats: next-tier note, got '%s'" % lines[0])
+	_expect(lines[0].contains("High Stakes Floor (T5) unlocks at 80"), "stats: next-tier note names venue, got '%s'" % lines[0])
 	_expect(lines[1] == "Lifetime:  137 hands over 9 sessions", "stats: lifetime line, got '%s'" % lines[1])
-	_expect(lines[2] == "Unlocked tiers:  T1, T2, T3, T4", "stats: unlocked line, got '%s'" % lines[2])
+	_expect(lines[2] == "Unlocked tiers:  Kitchen Table (T1), The Rec Room (T2), Card Room (T3), City Casino (T4)", "stats: unlocked line uses venue names, got '%s'" % lines[2])
 	_expect(lines[3] == "Counting systems:  Hi-Lo, KO", "stats: systems line, got '%s'" % lines[3])
 	_expect(lines[4] == "Heat floors:  T2 40%, T3 75%", "stats: heat-floors line, got '%s'" % lines[4])
 	# Overlay wiring: hidden at rest; Tab opens it (populating 5 lines); Esc closes.
@@ -741,6 +895,10 @@ func _check_stats_panel(main: Control) -> void:
 # overrides that make the teaching table safe for a learning session.
 func _check_tutorial_mode(main: Control) -> void:
 	main._start_session(1, CHGameState.MODE_TUTORIAL, 0, 3)
+	# Session start now shows the venue banner (M122). Reset it so the assertions
+	# below test the stage-transition banner's rest state, not the venue banner.
+	main._tutorial_banner.visible = false
+	main._tutorial_banner.modulate.a = 1.0
 	var st: CHGameState = main._state
 	_expect(st.session_mode == CHGameState.MODE_TUTORIAL, "tut: mode is tutorial")
 	_expect(st.current_tier == 1, "tut: anchored to tier 1, got %d" % st.current_tier)
@@ -764,14 +922,15 @@ func _check_tutorial_mode(main: Control) -> void:
 		_expect(not main._action_buttons[a].visible, "tut: action %s hidden in stage 1" % a)
 
 	# One "Next" press: begins the hand AND auto-bets it (stage 1), so a hand is
-	# now live and the player is in a decision phase. No bet control was touched.
+	# now live and the player is in a decision phase (or settled if a natural was
+	# dealt — a valid outcome of the auto-bet path). No bet control was touched.
 	main._on_tutorial_next()
-	_expect(not main._loop.is_idle(), "tut: a hand is live after Next")
 	var ph: String = main._loop.phase()
-	_expect(ph != CHGameLoop.PHASE_BET and ph != CHGameLoop.PHASE_IDLE and ph != CHGameLoop.PHASE_SETTLED,
+	_expect(ph != CHGameLoop.PHASE_BET and ph != CHGameLoop.PHASE_IDLE,
 		"tut: auto-bet advanced past BET, got '%s'" % ph)
-	_expect(not main._deal_button.visible, "tut: deal button stays hidden mid-hand")
-	_expect(main._tutorial_next_button.visible, "tut: next button stays visible mid-hand")
+	if ph != CHGameLoop.PHASE_SETTLED:
+		_expect(not main._deal_button.visible, "tut: deal button stays hidden mid-hand")
+		_expect(main._tutorial_next_button.visible, "tut: next button stays visible mid-hand")
 	# The opening cards were dealt and rendered.
 	_expect(main._loop.dealer_upcard() != null, "tut: dealer upcard dealt")
 
@@ -825,8 +984,11 @@ func _check_tutorial_mode(main: Control) -> void:
 	main._on_bet_units(2)
 	_expect(main._status_label.text.begins_with("Bet: "), "tut: stage-2 bet shows ramp feedback, got '%s'" % main._status_label.text)
 	# Negative control: practice on the same T1 table (grade_bet_ramp off, not
-	# tutorial) must NOT show ramp feedback.
+	# tutorial) must NOT show ramp feedback. T1 practice is now count-only (the
+	# hand auto-plays, so there is no BET phase to bet in); this check exercises
+	# the bet-feedback text path, so test it with count-only off.
 	main._start_session(1, CHGameState.MODE_PRACTICE, 0, 1)
+	main._loop.config.count_only = false
 	main._on_deal()
 	_expect(main._loop.phase() == CHGameLoop.PHASE_BET, "tut: practice deal lands in BET, got %s" % main._loop.phase())
 	main._on_bet_units(1)
@@ -863,6 +1025,247 @@ func _check_tutorial_mode(main: Control) -> void:
 	# S1 avg = (100+90)/2 = 95, S2 avg = 100
 	_expect(summary.contains("95"), "tut: summary shows S1 avg 95, got '%s'" % summary)
 	_expect(summary.contains("100"), "tut: summary shows S2 avg 100, got '%s'" % summary)
+
+
+# M121: the Tier 1 teaching table is count-only. Verify the scene (a) hides
+# every bet / cover / play control, (b) auto-plays the hand so the player never
+# sits in BET, and (c) gates the deal button on the pending running-count report
+# so the count is the player's sole interaction.
+func _check_count_only_teaching_table(main: Control) -> void:
+	main._hide_help()
+	main._start_session(1, CHGameState.MODE_TARGET, 150, 3)
+	_expect(main._loop.config.count_only == true, "count-only: T1 teaching table is count-only")
+	# Fresh session: no count check pending, so the deal button is available.
+	_expect(main._loop.is_count_check_due() == false, "count-only: no check pending at session start")
+	_expect(main._deal_button.visible, "count-only: deal button visible when idle")
+	_expect(main._deal_button.disabled == false, "count-only: deal enabled with no check pending")
+	# Deal: the hand auto-bets and auto-plays straight to settle; the player
+	# never rests in the BET phase.
+	main._on_deal()
+	_expect(main._loop.phase() == CHGameLoop.PHASE_SETTLED,
+		"count-only: auto-play settles the hand, got %s" % main._loop.phase())
+	_expect(main._status_label.text.contains("running count"),
+		"count-only: status reinforces the count report, got '%s'" % main._status_label.text)
+	# The player's own cards must be visible (not just the dealer's): the
+	# auto-played hand stays on the table so the player can see and count the
+	# cards that were played. Without this the teaching table is just a dealer
+	# card stream and the player cannot track the running count.
+	var player_rows := 0
+	for c in main._player_area.get_children():
+		if c is HBoxContainer and c != main._dealer_row:
+			player_rows += 1
+	_expect(player_rows >= 1,
+		"count-only: player's own hand cards are shown (not just the dealer's), got %d player row(s)" % player_rows)
+	# No bet / cover / play controls are offered on the teaching table.
+	for u in main._bet_buttons.keys():
+		_expect(not main._bet_buttons[u].visible, "count-only: bet button %s hidden" % u)
+	_expect(not main._cover_toggle.visible, "count-only: cover toggle hidden")
+	for a in main._action_buttons.keys():
+		_expect(not main._action_buttons[a].visible, "count-only: action %s hidden" % a)
+	# The live running count is hidden so the player must track it themselves;
+	# the HUD shows a tracking nudge instead of the numeric TC readout.
+	_expect(not main._tc_label.text.begins_with("TC:"),
+		"count-only: numeric TC readout hidden, got '%s'" % main._tc_label.text)
+	_expect(main._tc_label.text.contains("track"),
+		"count-only: HUD shows a tracking nudge, got '%s'" % main._tc_label.text)
+	# The player made no decisions, so the Decisions read-out is hidden too.
+	_expect(not main._decision_acc_label.visible,
+		"count-only: decisions label hidden (no player decisions), got visible=%s" % str(main._decision_acc_label.visible))
+	# The per-hand count check fired (count_check_active), so the deal button is
+	# now gated until the player reports the running count.
+	_expect(main._loop.is_count_check_due(),
+		"count-only: per-hand count check pending after the auto-played hand")
+	_expect(main._deal_button.disabled == true, "count-only: deal gated while the count check is pending")
+	# Answering the check re-enables the deal button.
+	main._loop._count_check_due = false
+	main._refresh_actions()
+	_expect(main._deal_button.disabled == false, "count-only: deal re-enabled once the check is answered")
+	# Drive a 1-shoe practice session (count_only stays on) to completion and
+	# check the debrief: it must surface the Counting line (the point of the
+	# table) and NOT a Decisions line (the engine auto-played, so M/N optimal is
+	# not the player's skill). Practice ends deterministically at the shoe cut.
+	main._start_session(1, CHGameState.MODE_PRACTICE, 0, 1)
+	var hands := 0
+	var guard := 0
+	while main._state.is_session_active() and hands < 40 and guard < 400:
+		if main._loop.is_count_check_due():
+			main._loop.report_count(main._loop.last_shoe_rc())
+		if not main._loop.begin_hand():
+			break
+		hands += 1
+		if main._loop.phase() == CHGameLoop.PHASE_BET:
+			main._loop.place_bet(main._loop.optimal_bet_units())
+		var g2 := 0
+		while not main._loop.is_idle() and g2 < 60:
+			main._loop.apply_action(main._loop.optimal_action())
+			g2 += 1
+			guard += 1
+	_expect(not main._state.is_session_active(),
+		"count-only: practice session completed, active=%s" % str(main._state.is_session_active()))
+	var debrief_text := ""
+	for l in main._debrief_lines:
+		debrief_text += l.text + "\n"
+	_expect(debrief_text.contains("Counting:"),
+		"count-only: debrief shows Counting line, got: " + debrief_text)
+	_expect(not debrief_text.contains("Decisions:"),
+		"count-only: debrief omits Decisions line, got: " + debrief_text)
+	# Restore the session this check disturbed for any later checks.
+	main._start_session(1, CHGameState.MODE_PRACTICE, 0, 1)
+	main._loop.config.count_only = false
+
+
+# The Tier-1 counting drill must not surface later-tier readouts. Heat (the pit's
+# suspicion meter), discipline (T2+ decision grading), and cover (only usable once
+# betting starts) are all hidden on the count-only teaching table, keeping the
+# on-ramp HUD limited to what the player is actually doing (tracking the count).
+# Each reappears at the tier that introduces its feature.
+func _check_t1_teaching_hud_clean(main: Control) -> void:
+	main._hide_help()
+	main._start_session(1, CHGameState.MODE_TARGET, 150, 3)
+	_expect(main._loop.config.count_only == true, "t1-hud: teaching table is count-only")
+	main._refresh_hud()
+	_expect(not main._heat_label.visible, "t1-hud: heat readout hidden on T1, got visible")
+	_expect(not main._discipline_label.visible, "t1-hud: discipline readout hidden on T1, got visible")
+	_expect(not main._cover_label.visible, "t1-hud: cover readout hidden on T1, got visible")
+	# Core on-ramp readouts stay: bankroll, tier, mode, and the count nudge.
+	_expect(main._bankroll_label.visible, "t1-hud: bankroll stays visible on T1")
+	_expect(main._tier_label.visible, "t1-hud: tier stays visible on T1")
+	_expect(main._mode_label.visible, "t1-hud: mode stays visible on T1")
+	_expect(main._tc_label.visible, "t1-hud: running-count nudge stays visible on T1")
+	# And they reappear at the tier that introduces the feature (T2 grades
+	# decisions and leaves the count-only drill, so cover + heat apply again).
+	main._start_session(2, CHGameState.MODE_TARGET, 150, 3)
+	main._refresh_hud()
+	_expect(main._discipline_label.visible, "t1-hud: discipline reappears at T2")
+	_expect(main._cover_label.visible, "t1-hud: cover reappears at T2")
+	_expect(main._heat_label.visible, "t1-hud: heat reappears at T2")
+	# Restore a clean session for any later checks.
+	main._start_session(1, CHGameState.MODE_PRACTICE, 0, 1)
+	main._loop.config.count_only = false
+
+
+func _check_npc_player_rows(main: Control) -> void:
+	var old_loop: CHGameLoop = main._loop
+	var config := CHTableConfig.new()
+	config.npc_players = 1
+	var state := CHGameState.new()
+	state.start_session(1, CHGameState.MODE_TARGET, 150, 3)
+	var new_loop := CHGameLoop.new(config, state, CHDisciplineSystem.new(), 20260906)
+
+	main._loop = new_loop
+	if not new_loop.begin_hand():
+		_failures.append("npc-rows: begin_hand failed")
+		main._loop = old_loop
+		return
+	new_loop.place_bet(1)
+	main._refresh_cards()
+
+	var found_npc_label := false
+	for c in main._player_area.get_children():
+		if c is HBoxContainer:
+			for child in c.get_children():
+				if child is Label and child.text.begins_with("Player 2"):
+					found_npc_label = true
+					break
+		if found_npc_label:
+			break
+
+	_expect(found_npc_label, "npc-rows: NPC row label 'Player 2' not found in player area")
+
+	main._loop = old_loop
+	main._refresh_cards()
+
+
+# The named opponent (Sal) must render its own row distinct from filler NPCs,
+# showing its name, bet size, and cards. The session-start loop always seats an
+# opponent (CHTableConfig._opponent_for_tier), so this is valid for any tier.
+func _check_opponent_row(main: Control) -> void:
+	var old_loop: CHGameLoop = main._loop
+	main._start_session(2, CHGameState.MODE_PRACTICE, 0, 1)
+	if not main._loop.begin_hand():
+		_failures.append("opp-row: begin_hand failed")
+		main._loop = old_loop
+		return
+	if main._loop.phase() == CHGameLoop.PHASE_BET:
+		main._loop.place_bet(1)
+	main._refresh_cards()
+	var found_opp := false
+	for c in main._player_area.get_children():
+		if c is HBoxContainer:
+			for child in c.get_children():
+				if child is Label and child.text.begins_with("Sal"):
+					found_opp = true
+					break
+		if found_opp:
+			break
+	_expect(found_opp, "opp-row: opponent row labeled with rival name not found")
+	main._loop = old_loop
+	main._refresh_cards()
+
+
+# Tier 1 is the count-only teaching table: the player counts alone, so there is
+# no named rival and no filler NPCs to add unseen cards to the count stream.
+func _check_t1_no_opponent(_main: Control) -> void:
+	var cfg: CHTableConfig = CHTableConfig.for_tier(1)
+	_expect(cfg.opponent == null, "t1-no-opp: T1 config has no opponent, got '%s'" % str(cfg.opponent))
+	_expect(cfg.npc_players == 0, "t1-no-opp: T1 has 0 NPC players, got %d" % cfg.npc_players)
+	var state := CHGameState.new()
+	state.start_session(1, CHGameState.MODE_TARGET, 150, 3)
+	var loop := CHGameLoop.new(cfg, state, CHDisciplineSystem.new(), 20260906)
+	_expect(loop.get_opponent() == null, "t1-no-opp: loop has no opponent, got '%s'" % str(loop.get_opponent()))
+
+
+# The dealer's drawn cards must render: before the fix, _refresh_cards only
+# showed upcard + hole, so dealer hits were counted into the running count but
+# invisible to the player (the count looked "wrong"). After the hole is
+# revealed every dealer card renders face-up, so the rendered card count must
+# equal the dealer hand size.
+func _check_dealer_drawn_cards_rendered(main: Control) -> void:
+	var old_loop: CHGameLoop = main._loop
+	var config := CHTableConfig.new()
+	config.deck_count = 1
+	config.allows_split = true
+	var state := CHGameState.new()
+	state.start_session(1, CHGameState.MODE_TARGET, 150, 3)
+	var loop := CHGameLoop.new(config, state, CHDisciplineSystem.new(), 20260906)
+	main._loop = loop
+	var seen_dealer_cards := 0
+	for h in 6:
+		if not loop.begin_hand():
+			break
+		if loop.phase() == CHGameLoop.PHASE_BET:
+			loop.place_bet(loop.optimal_bet_units())
+		var guard := 0
+		while not loop.is_idle() and guard < 64:
+			loop.apply_action(loop.optimal_action())
+			guard += 1
+		var before: int = main._dealer_cards.get_child_count()
+		main._refresh_cards()
+		var after: int = main._dealer_cards.get_child_count()
+		var held: int = loop.dealer_hand().cards.size()
+		# Once the hole is revealed, _refresh_cards also appends the hand-total
+		# label (the verification readout), so the child delta is held + 1.
+		var revealed: bool = loop.dealer_hole() != null
+		var expected: int = held + (1 if revealed else 0)
+		if loop.dealer_hand().cards.size() > 2:
+			seen_dealer_cards += 1
+		_expect(after - before == expected,
+			"dealer-cards: hand %d added %d children, expected %d (dealer holds %d, revealed=%s)" % [h, after - before, expected, held, revealed])
+	_expect(seen_dealer_cards > 0, "dealer-cards: at least one dealer hit across 6 hands (got %d)" % seen_dealer_cards)
+	main._loop = old_loop
+	main._refresh_cards()
+
+
+func _check_venue_banner(main: Control) -> void:
+	# Start a session and confirm the venue banner text is populated from the
+	# tier config's venue_name + venue_hook.
+	var old_loop: CHGameLoop = main._loop
+	main._start_session(1, CHGameState.MODE_TARGET, 150, 3)
+	var cfg: CHTableConfig = CHTableConfig.for_tier(1)
+	var expected: String = "%s — %s" % [cfg.venue_name, cfg.venue_hook]
+	_expect(main._tutorial_banner.text == expected,
+		"venue-banner: expected '%s', got '%s'" % [expected, main._tutorial_banner.text])
+	main._loop = old_loop
 
 
 func _finish() -> void:

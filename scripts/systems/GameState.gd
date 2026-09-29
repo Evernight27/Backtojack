@@ -155,6 +155,12 @@ func end_session(reason: String, session_process_score: float = 0.0, persist: bo
 	lifetime_stats["sessions_played"] = int(lifetime_stats.get("sessions_played", 0)) + 1
 	# Auto-unlock any tier whose threshold the new skill rating now meets.
 	_unlock_qualified_tiers(new_rating)
+	# Record the counting system trained on this tier so the career screen lists
+	# it. Done here, before the save below, so the record is persisted in the same
+	# write as the session stats — a post-signal unlock (as it was) only reached
+	# disk on a later save and was lost if the player quit right after first
+	# playing a new system.
+	unlock_system(CHTableConfig.for_tier(current_tier).count_system)
 	session_active = false
 	last_end_reason = reason
 	# Bankroll is session-scoped; it does not carry into the next session.

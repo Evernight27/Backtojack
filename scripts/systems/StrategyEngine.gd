@@ -86,7 +86,7 @@ func _hard_play(total: int, dk: int, _config: CHTableConfig) -> String:
 				return "stand"
 			return "hit"
 		15:
-			if dk >= 2 and dk <= 6:
+			if dk >= 4 and dk <= 6:
 				return "stand"
 			return "hit"
 		14:
@@ -149,7 +149,7 @@ func _soft_play(total: int, dk: int, _config: CHTableConfig) -> String:
 			return "hit"
 
 
-func _pair_play(hand: CHHand, dk: int, _config: CHTableConfig) -> String:
+func _pair_play(hand: CHHand, dk: int, config: CHTableConfig) -> String:
 	var rank: int = hand.cards[0].rank
 	match rank:
 		14:  # aces
@@ -167,7 +167,9 @@ func _pair_play(hand: CHHand, dk: int, _config: CHTableConfig) -> String:
 				return "split"
 			return "hit"
 		6:
-			if dk >= 4 and dk <= 7:
+			# S17/DAS: split 6s vs 2-7. H17: split only vs 4-7.
+			var lo: int = 4 if config.dealer_hits_soft_17 else 2
+			if dk >= lo and dk <= 7:
 				return "split"
 			return "hit"
 		5:
